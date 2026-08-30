@@ -1,0 +1,3 @@
+representation: robust_band_rgb
+frames: 5
+dtype: float16

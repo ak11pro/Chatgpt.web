@@ -23,7 +23,10 @@ class SamuraiTracker:
     def __init__(self, predictor): self.predictor=predictor; self.state=SamuraiState()
     def initialize(self, frame, xywh): self.state.box=np.asarray(xywh,float); self.predictor.initialize(frame, self.state.box); return self.state.box.copy()
     def track(self, frame):
-        output=self.predictor.track(frame); arr=np.asarray(output)
+        output=self.predictor.next_mask() if hasattr(self.predictor, "next_mask") else self.predictor.track(frame)
+        if isinstance(output, tuple) and len(output) == 2:
+            _, output = output
+        arr=np.asarray(output)
         self.state.box=mask_to_xywh(arr) if arr.ndim==2 else arr.astype(float)
         return self.state.box.copy()
     def reset(self): self.predictor.reset(); self.state=SamuraiState()
