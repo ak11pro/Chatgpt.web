@@ -1,0 +1,7 @@
+representation:
+  type: robust_band_rgb
+  bands:
+    vis: [1, 8, 14]
+    nir: [2, 12, 22]
+    rednir: [1, 7, 13]
+validation: {seed: 2026, sequences: 24}
