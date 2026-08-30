@@ -1,12 +1,34 @@
-"""Kaggle runner: requires a concrete SAMURAI predictor factory supplied by integration code."""
-import argparse,json,platform,time,sys
+"""Run one or more mounted HOTC sequences through SAMURAI video propagation."""
+import argparse,csv,json,platform,sys,tempfile,time
 from pathlib import Path
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'src'))
+import numpy as np
+from PIL import Image
+from hotc_tracker.data.loaders import DirectoryFrameSource
 from hotc_tracker.data.sequences import group_annotations
-from hotc_tracker.tracking.samurai_tracker import resolve_samurai_assets
+from hotc_tracker.evaluation import ope_metrics
+from hotc_tracker.representations import representation, SENSOR_BANDS
+from hotc_tracker.tracking.box_utils import clip_xywh, mask_to_xywh
+from hotc_tracker.tracking.samurai_backend import build_samurai_predictor
+
 def main():
- p=argparse.ArgumentParser();p.add_argument('--data-root',required=True);p.add_argument('--annotations',required=True);p.add_argument('--checkpoint');p.add_argument('--config');p.add_argument('--representation',choices=['robust_band_rgb','pca_rgb'],required=True);p.add_argument('--output',required=True);a=p.parse_args()
- assets=resolve_samurai_assets(checkpoint=a.checkpoint,samurai_config=a.config); groups=group_annotations(a.annotations); out=Path(a.output);out.mkdir(parents=True,exist_ok=True)
- # Deliberately fail before inference until the mounted SAMURAI API is verified and bound to SamuraiTracker.
- metadata={'python':platform.python_version(),'representation':a.representation,'data_root':a.data_root,'assets':{k:str(v) for k,v in assets.items()},'sequences':len(groups),'status':'assets_resolved_api_binding_pending','started_at':time.time()};(out/'metadata.json').write_text(json.dumps(metadata,indent=2)); raise RuntimeError('SAMURAI source API binding is required before real HOTC inference; no predictions were generated.')
+ p=argparse.ArgumentParser(); p.add_argument('--data-root',required=True);p.add_argument('--annotations',required=True);p.add_argument('--checkpoint');p.add_argument('--config');p.add_argument('--source-root');p.add_argument('--representation',choices=['robust_band_rgb','pca_rgb'],required=True);p.add_argument('--output',required=True);p.add_argument('--sequences',nargs='*');p.add_argument('--extension',default='.npy');p.add_argument('--frame-key');a=p.parse_args()
+ groups=group_annotations(a.annotations); chosen=a.sequences or list(groups); out=Path(a.output);out.mkdir(parents=True,exist_ok=True); source=DirectoryFrameSource(a.data_root,a.extension,a.frame_key,SENSOR_BANDS); all_preds=[]; per=[]; started=time.time()
+ backend=build_samurai_predictor(a.checkpoint,a.config,source_root=a.source_root)
+ for key in chosen:
+  rows=groups[key]; sensor=rows[0][0].sensor; gt=np.array([[float(r[k]) for k in ('x','y','width','height')] for _,r in rows]);
+  with tempfile.TemporaryDirectory(prefix='hotc_rgb_') as d:
+   d=Path(d); cubes=[]
+   for parsed,_ in rows:
+    cube=source.frame(key,parsed.frame); rgb=representation(cube,a.representation,sensor); Image.fromarray(rgb).save(d/f'{parsed.frame-rows[0][0].frame:05d}.jpg'); cubes.append(cube.shape)
+   # SAM2 sorts frame image names; use contiguous names above and first GT prompt.
+   backend.initialize(d,gt[0]); preds=[clip_xywh(gt[0],cubes[0])]; fallbacks=[]
+   for index in range(1,len(rows)):
+    try: _,mask=backend.next_mask(); preds.append(clip_xywh(mask_to_xywh(mask),cubes[index]))
+    except (StopIteration,ValueError) as exc: preds.append(preds[-1]); fallbacks.append({'frame':rows[index][0].frame,'reason':type(exc).__name__})
+  metrics=ope_metrics(np.asarray(preds),gt); per.append({'sequence':key,'sensor':sensor,**{k:v for k,v in metrics.items() if k!='success_curve'},'fallback_count':len(fallbacks)}); all_preds += [{'ID':r['ID'],'x':b[0],'y':b[1],'width':b[2],'height':b[3]} for (_,r),b in zip(rows,preds)]
+  print({'sequence':key,'sensor':sensor,'frames':len(rows),'hsi_shape':cubes[0],'first_box':preds[0].tolist(),'last_box':preds[-1].tolist(),**per[-1]})
+ with (out/'predictions.csv').open('w',newline='') as f: w=csv.DictWriter(f,fieldnames=['ID','x','y','width','height']);w.writeheader();w.writerows(all_preds)
+ with (out/'per_sequence.csv').open('w',newline='') as f: w=csv.DictWriter(f,fieldnames=per[0].keys());w.writeheader();w.writerows(per)
+ aggregate={k:float(np.mean([r[k] for r in per])) for k in ('mean_iou','precision_at_20','success_auc','fallback_count')};(out/'aggregate.json').write_text(json.dumps(aggregate,indent=2));(out/'metadata.json').write_text(json.dumps({'python':platform.python_version(),'representation':a.representation,'runtime_seconds':time.time()-started,'sequences':chosen},indent=2))
 if __name__=='__main__': main()
