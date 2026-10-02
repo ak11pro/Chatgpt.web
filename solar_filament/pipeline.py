@@ -729,36 +729,46 @@ def validate(model: nn.Module, dataset: SolarFilamentDataset, config: PipelineCo
 
 @torch.inference_mode()
 def cache_validation_predictions(model: nn.Module, dataset: SolarFilamentDataset, config: PipelineConfig,
-                                 device: torch.device, cache_dir: str | Path) -> list[tuple[np.ndarray, np.ndarray | None, np.ndarray]]:
-    """Persist full-resolution validation outputs so post-processing never re-runs the model."""
+                                 device: torch.device, cache_dir: str | Path) -> list[tuple[np.ndarray, np.ndarray | None, np.ndarray, np.ndarray]]:
+    """Persist full-resolution validation outputs and disk masks so post-processing matches final inference."""
     destination = Path(cache_dir); destination.mkdir(parents=True, exist_ok=True)
-    cached: list[tuple[np.ndarray, np.ndarray | None, np.ndarray]] = []
+    cached: list[tuple[np.ndarray, np.ndarray | None, np.ndarray, np.ndarray]] = []
     for image_id in dataset.image_ids:
         path = destination / f"{image_id}.npz"
         if path.exists():
             loaded = np.load(path)
             boundary = loaded["boundary"] if "boundary" in loaded.files else None
-            cached.append((loaded["semantic"], boundary, loaded["truth"]))
+            disk = loaded["disk"] if "disk" in loaded.files else np.ones(loaded["truth"].shape, dtype=bool)
+            cached.append((loaded["semantic"], boundary, loaded["truth"], disk))
             continue
         meta = dataset.index.images[image_id]
         image = np.asarray(Image.open(dataset.image_dir / meta["file_name"]).convert("L"))
         semantic, boundary = predict_tiled(model, image, config, device)
         truth = build_instance_id_mask(dataset.index, image_id)
-        payload: dict[str, np.ndarray] = {"semantic": semantic, "truth": truth}
-        if boundary is not None: payload["boundary"] = boundary
+        disk = detect_solar_disk(image)
+        payload: dict[str, np.ndarray] = {
+            "semantic": semantic.astype(np.float16),
+            "truth": truth.astype(np.int32),
+            "disk": disk.astype(np.uint8),
+        }
+        if boundary is not None:
+            payload["boundary"] = boundary.astype(np.float16)
         np.savez_compressed(path, **payload)
-        cached.append((semantic, boundary, truth))
+        cached.append((semantic, boundary, truth, disk))
     return cached
 
 
 def optimize_postprocessing(probabilities: Iterable[np.ndarray], boundaries: Iterable[np.ndarray | None],
-                            truths: Iterable[np.ndarray], base: PipelineConfig) -> tuple[PipelineConfig, pd.DataFrame]:
+                            truths: Iterable[np.ndarray], base: PipelineConfig,
+                            disk_masks: Iterable[np.ndarray] | None = None) -> tuple[PipelineConfig, pd.DataFrame]:
     """Staged PQ-first search over cached maps; every evaluated setting is retained."""
-    cached = list(zip(probabilities, boundaries, truths)); rows: list[dict[str, float]] = []
+    if disk_masks is None:
+        disk_masks = (None for _ in truths)
+    cached = list(zip(probabilities, boundaries, truths, disk_masks)); rows: list[dict[str, float]] = []
     def evaluate(stage: str, update: dict[str, Any]) -> PipelineConfig:
         candidate = PipelineConfig(**{**asdict(base), **update})
-        panoptic = [compute_pq(reconstruct_instances(p, candidate, b), truth) for p, b, truth in cached]
-        semantic = [compute_segmentation_metrics(reconstruct_instances(p, candidate, b) > 0, truth > 0) for p, b, truth in cached]
+        panoptic = [compute_pq(reconstruct_instances(p, candidate, b, d), truth) for p, b, truth, d in cached]
+        semantic = [compute_segmentation_metrics(reconstruct_instances(p, candidate, b, d) > 0, truth > 0) for p, b, truth, d in cached]
         rows.append({"stage": stage, **update, "mean_pq": float(np.mean([x["pq"] for x in panoptic])),
                      "mean_dice": float(np.mean([x["dice"] for x in semantic])), "mean_iou": float(np.mean([x["iou"] for x in semantic]))})
         return candidate
