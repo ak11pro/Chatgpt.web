@@ -1,7 +1,7 @@
 """Competition-compliant training and inference pipeline for MAGFiLO COCO data.
 
 Predictions are always derived from model logits.  This module intentionally has
-no test-image lookup tables, fallback masks, or precomputed RLE payloads.
+no test-image lookup tables or precomputed RLE payloads.
 """
 
 from __future__ import annotations
@@ -89,8 +89,10 @@ class CompetitionData:
 
 @dataclass
 class InstanceRecord:
-    image_id: int
-    annotation_id: int
+    """One annotator-specific filament target; identifiers are opaque strings."""
+
+    image_id: str
+    annotation_id: str
     bbox: tuple[float, float, float, float]
     area: float
     segmentation: Any
@@ -98,8 +100,10 @@ class InstanceRecord:
 
 @dataclass
 class CocoIndex:
-    images: dict[int, dict[str, Any]]
-    annotations_by_image: dict[int, list[InstanceRecord]]
+    """COCO entries remain separate even when they share one physical JPEG."""
+
+    images: dict[str, dict[str, Any]]
+    annotations_by_image: dict[str, list[InstanceRecord]]
     categories: list[dict[str, Any]]
 
 
@@ -135,8 +139,9 @@ def find_competition_data(root: str | Path = "/kaggle/input") -> CompetitionData
         "training_images": len(index.images), "annotations": len(areas), "test_images": test_count,
         "sample_dimensions": [sample.get("width"), sample.get("height")],
         "filament_instances": len(areas),
-        "instance_area": {"min": min(areas, default=0), "median": float(np.median(areas)) if areas else 0,
-                          "max": max(areas, default=0)},
+        "instance_area": ({"min": min(areas), "p1": float(np.percentile(areas, 1)), "p5": float(np.percentile(areas, 5)),
+                           "p25": float(np.percentile(areas, 25)), "median": float(np.median(areas)),
+                           "p75": float(np.percentile(areas, 75)), "p95": float(np.percentile(areas, 95)), "max": max(areas)} if areas else {}),
         "categories": index.categories,
     }, indent=2, default=str))
     return data
@@ -146,21 +151,61 @@ def list_image_files(directory: Path) -> list[Path]:
     return sorted(p for p in directory.iterdir() if p.suffix.lower() in {".png", ".jpg", ".jpeg", ".tif", ".tiff"})
 
 
+def get_physical_observation_key(image_meta: dict[str, Any]) -> str:
+    """Physical JPEG identity, deliberately distinct from the COCO annotation entry ID."""
+    return Path(str(image_meta["file_name"])).name
+
+
+def get_annotation_entry_key(image_meta: dict[str, Any]) -> str:
+    """Opaque COCO image-entry identity; never coerce it to an integer."""
+    image_id = image_meta["id"]
+    if not isinstance(image_id, str):
+        raise TypeError(f"MAGFiLO image id must be a string, got {type(image_id).__name__}")
+    return image_id
+
+
+def group_by_physical_observation(index: CocoIndex) -> dict[str, list[str]]:
+    grouped: dict[str, list[str]] = defaultdict(list)
+    for image_id, image_meta in index.images.items():
+        grouped[get_physical_observation_key(image_meta)].append(image_id)
+    return dict(grouped)
+
+
 def load_coco_annotations(annotation_json: str | Path) -> CocoIndex:
     """Load every COCO instance without collapsing per-filament identity."""
     with Path(annotation_json).open(encoding="utf-8") as handle:
         raw = json.load(handle)
-    images = {int(image["id"]): image for image in raw["images"]}
-    grouped: dict[int, list[InstanceRecord]] = defaultdict(list)
+    if not raw.get("images") or not raw.get("annotations"):
+        raise ValueError("COCO JSON must include non-empty images and annotations lists")
+    images: dict[str, dict[str, Any]] = {}
+    for image in raw["images"]:
+        image_id = get_annotation_entry_key(image)
+        if image_id in images:
+            raise ValueError(f"Duplicate COCO image id: {image_id}")
+        if int(image["width"]) != 2048 or int(image["height"]) != 2048:
+            raise ValueError(f"MAGFiLO image {image_id} must be 2048x2048, got {image['width']}x{image['height']}")
+        images[image_id] = image
+    grouped: dict[str, list[InstanceRecord]] = defaultdict(list)
     for ann in raw["annotations"]:
+        if not isinstance(ann.get("id"), str) or not isinstance(ann.get("image_id"), str):
+            raise TypeError("MAGFiLO annotation id and image_id must be strings")
+        if ann["image_id"] not in images:
+            raise ValueError(f"Annotation {ann['id']} references missing image id {ann['image_id']}")
+        if ann.get("iscrowd", 0) != 0:
+            raise ValueError(f"MAGFiLO annotation {ann['id']} unexpectedly has iscrowd != 0")
         if ann.get("iscrowd", 0):
             LOGGER.warning("Crowd annotation %s is retained as a single instance", ann["id"])
-        grouped[int(ann["image_id"])].append(InstanceRecord(
-            image_id=int(ann["image_id"]), annotation_id=int(ann["id"]),
+        grouped[ann["image_id"]].append(InstanceRecord(
+            image_id=ann["image_id"], annotation_id=ann["id"],
             bbox=tuple(float(x) for x in ann.get("bbox", (0, 0, 0, 0))),
             area=float(ann.get("area", 0)), segmentation=ann["segmentation"],
         ))
-    return CocoIndex(images, dict(grouped), raw.get("categories", []))
+    index = CocoIndex(images, dict(grouped), raw.get("categories", []))
+    physical = group_by_physical_observation(index)
+    print(json.dumps({"coco_annotation_image_entries": len(index.images), "unique_physical_observations": len(physical),
+                      "annotation_count": sum(map(len, index.annotations_by_image.values())),
+                      "category_names": [category.get("name") for category in index.categories]}, indent=2))
+    return index
 
 
 def _decode_annotation(instance: InstanceRecord, height: int, width: int) -> np.ndarray:
@@ -176,13 +221,13 @@ def _decode_annotation(instance: InstanceRecord, height: int, width: int) -> np.
     return decoded.max(axis=2) if decoded.ndim == 3 else decoded
 
 
-def build_instance_masks(index: CocoIndex, image_id: int) -> list[np.ndarray]:
+def build_instance_masks(index: CocoIndex, image_id: str) -> list[np.ndarray]:
     image = index.images[image_id]
     return [_decode_annotation(ann, int(image["height"]), int(image["width"])).astype(bool)
             for ann in index.annotations_by_image.get(image_id, [])]
 
 
-def build_semantic_mask(index: CocoIndex, image_id: int) -> np.ndarray:
+def build_semantic_mask(index: CocoIndex, image_id: str) -> np.ndarray:
     image = index.images[image_id]
     mask = np.zeros((int(image["height"]), int(image["width"])), dtype=bool)
     for instance in build_instance_masks(index, image_id):
@@ -190,7 +235,7 @@ def build_semantic_mask(index: CocoIndex, image_id: int) -> np.ndarray:
     return mask
 
 
-def build_instance_id_mask(index: CocoIndex, image_id: int) -> np.ndarray:
+def build_instance_id_mask(index: CocoIndex, image_id: str) -> np.ndarray:
     image = index.images[image_id]
     output = np.zeros((int(image["height"]), int(image["width"])), dtype=np.int32)
     for label, instance in enumerate(build_instance_masks(index, image_id), start=1):
@@ -201,19 +246,23 @@ def build_instance_id_mask(index: CocoIndex, image_id: int) -> np.ndarray:
     return output
 
 
-def group_train_validation_split(index: CocoIndex, fraction: float, seed: int) -> tuple[list[int], list[int]]:
-    ids = np.array(sorted(index.images))
-    groups = np.array([str(index.images[i].get("observation_id", i)) for i in ids])
+def group_train_validation_split(index: CocoIndex, fraction: float, seed: int) -> tuple[list[str], list[str]]:
+    """Split COCO annotation entries by physical JPEG to prevent annotator leakage."""
+    ids = np.array(sorted(index.images), dtype=object)
+    groups = np.array([get_physical_observation_key(index.images[image_id]) for image_id in ids], dtype=object)
     train_idx, val_idx = next(GroupShuffleSplit(n_splits=1, test_size=fraction, random_state=seed).split(ids, groups=groups))
     train_ids, val_ids = ids[train_idx].tolist(), ids[val_idx].tolist()
-    assert not set(groups[train_idx]).intersection(groups[val_idx]), "Observation leakage detected"
-    print(f"train observations={len(train_ids)}, validation observations={len(val_ids)}, "
-          f"train instances={sum(len(index.annotations_by_image.get(i, [])) for i in train_ids)}, "
-          f"validation instances={sum(len(index.annotations_by_image.get(i, [])) for i in val_ids)}")
+    train_physical, val_physical = set(groups[train_idx]), set(groups[val_idx])
+    assert train_physical.isdisjoint(val_physical), "Physical-observation leakage detected"
+    print(f"COCO annotation-image entries={len(ids)}, unique physical observations={len(set(groups))}, "
+          f"training annotation entries={len(train_ids)}, validation annotation entries={len(val_ids)}, "
+          f"training physical observations={len(train_physical)}, validation physical observations={len(val_physical)}, "
+          f"training filament instances={sum(len(index.annotations_by_image.get(i, [])) for i in train_ids)}, "
+          f"validation filament instances={sum(len(index.annotations_by_image.get(i, [])) for i in val_ids)}")
     return train_ids, val_ids
 
 
-def measure_foreground_prevalence(index: CocoIndex, image_ids: Sequence[int]) -> dict[str, float]:
+def measure_foreground_prevalence(index: CocoIndex, image_ids: Sequence[str]) -> dict[str, float]:
     """Measure imbalance from decoded training masks; never use a guessed BCE weight."""
     foreground = 0
     pixels = 0
@@ -256,18 +305,18 @@ def boundary_target(instance_ids: np.ndarray) -> np.ndarray:
     return boundary
 
 
-class SolarFilamentDataset(Dataset[dict[str, Tensor]]):
-    """High-resolution, filament-aware crop sampler retaining instance targets."""
+class SolarFilamentDataset(Dataset[dict[str, Any]]):
+    """High-resolution sampler; duplicate physical JPEGs retain independent annotator masks."""
 
-    def __init__(self, index: CocoIndex, image_dir: Path, image_ids: Sequence[int], config: PipelineConfig,
+    def __init__(self, index: CocoIndex, image_dir: Path, image_ids: Sequence[str], config: PipelineConfig,
                  training: bool) -> None:
         self.index, self.image_dir, self.image_ids, self.config, self.training = index, image_dir, list(image_ids), config, training
         total = config.positive_probability + config.hard_negative_probability + config.random_probability
         if training and not np.isclose(total, 1.0):
             raise ValueError("Crop sampling probabilities must sum to one")
         self._sampling_counts: dict[str, int] = defaultdict(int)
-        self.positive_centers: dict[int, np.ndarray] = {}
-        self.hard_negative_centers: dict[int, np.ndarray] = {}
+        self.positive_centers: dict[str, np.ndarray] = {}
+        self.hard_negative_centers: dict[str, np.ndarray] = {}
         if training:
             self._build_crop_candidates()
 
@@ -313,9 +362,10 @@ class SolarFilamentDataset(Dataset[dict[str, Tensor]]):
         return {"image": torch.from_numpy(robust_normalize(image)[None]),
                 "semantic": torch.from_numpy(semantic[None]),
                 "boundary": torch.from_numpy(boundary_target(instance_ids)[None].astype(np.float32)),
-                "instance_ids": torch.from_numpy(instance_ids), "image_id": torch.tensor(image_id)}
+                "instance_ids": torch.from_numpy(instance_ids), "image_id": image_id,
+                "sample_index": torch.tensor(item, dtype=torch.int64)}
 
-    def _sample_crop(self, image: np.ndarray, labels: np.ndarray, image_id: int) -> tuple[np.ndarray, np.ndarray]:
+    def _sample_crop(self, image: np.ndarray, labels: np.ndarray, image_id: str) -> tuple[np.ndarray, np.ndarray]:
         size = self.config.train_tile_size
         pad_h, pad_w = max(0, size - image.shape[0]), max(0, size - image.shape[1])
         image, labels = np.pad(image, ((0, pad_h), (0, pad_w))), np.pad(labels, ((0, pad_h), (0, pad_w)))
@@ -618,13 +668,28 @@ def environment_report(config: PipelineConfig) -> dict[str, Any]:
             "cuda": torch.version.cuda, "device": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU"}
 
 
-def train_one_epoch(model: nn.Module, loader: DataLoader, optimizer: torch.optim.Optimizer, scaler: torch.amp.GradScaler,
+def build_grad_scaler(device: torch.device, enabled: bool) -> Any:
+    """Support both current torch.amp and older torch.cuda.amp Kaggle images."""
+    active = enabled and device.type == "cuda"
+    if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
+        return torch.amp.GradScaler(device.type, enabled=active)
+    return torch.cuda.amp.GradScaler(enabled=active)
+
+
+def amp_autocast(device: torch.device, enabled: bool) -> Any:
+    active = enabled and device.type == "cuda"
+    if hasattr(torch, "amp") and hasattr(torch.amp, "autocast"):
+        return torch.amp.autocast(device_type=device.type, enabled=active)
+    return torch.cuda.amp.autocast(enabled=active)
+
+
+def train_one_epoch(model: nn.Module, loader: DataLoader, optimizer: torch.optim.Optimizer, scaler: Any,
                     config: PipelineConfig, device: torch.device, pos_weight: float) -> float:
     """One AMP-enabled epoch with accumulation and clipping for large tiles."""
     model.train(); optimizer.zero_grad(set_to_none=True); losses: list[float] = []
     for step, batch in enumerate(loader, 1):
         batch = {key: value.to(device) if isinstance(value, Tensor) else value for key, value in batch.items()}
-        with torch.autocast(device_type=device.type, enabled=config.use_amp and device.type == "cuda"):
+        with amp_autocast(device, config.use_amp):
             loss = compound_loss(model(batch["image"]), batch, config, pos_weight) / config.gradient_accumulation
         scaler.scale(loss).backward()
         if step % config.gradient_accumulation == 0 or step == len(loader):
@@ -715,13 +780,13 @@ def optimize_postprocessing(probabilities: Iterable[np.ndarray], boundaries: Ite
 
 
 def append_experiment(path: str | Path, name: str, config: PipelineConfig, metrics: dict[str, float], runtime_seconds: float,
-                      pos_weight: float) -> None:
+                      pos_weight: float, split_summary: dict[str, int] | None = None) -> None:
     """Append measured results only; callers must never insert claimed scores."""
     row = {"experiment": name, "architecture": "resnet34_unet", "encoder": config.encoder,
            "pretrained": config.pretrained_encoder, "tile_size": config.train_tile_size, "epochs": config.epochs,
            "batch_size": config.batch_size, "learning_rate": config.learning_rate, "loss": json.dumps(config.loss_weights, sort_keys=True),
            "pos_weight": pos_weight, "threshold": config.threshold, "min_area": config.min_component_area,
            "watershed": config.watershed, "peak_distance": config.watershed_peak_distance, "boundary_mode": config.boundary_mode,
-           "tta": config.use_tta, "runtime_seconds": runtime_seconds, **metrics}
+           "tta": config.use_tta, "runtime_seconds": runtime_seconds, **(split_summary or {}), **metrics}
     destination = Path(path); previous = pd.read_csv(destination) if destination.exists() else pd.DataFrame()
     pd.concat([previous, pd.DataFrame([row])], ignore_index=True).to_csv(destination, index=False)

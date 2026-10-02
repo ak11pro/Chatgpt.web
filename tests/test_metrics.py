@@ -1,8 +1,12 @@
 """Synthetic regression tests for strict, competition-aligned PQ behaviour."""
 
-import numpy as np
+import json
 
-from solar_filament.pipeline import compute_pq, match_instances, relabel_sequential
+import numpy as np
+from pycocotools import mask as coco_mask
+
+from solar_filament.pipeline import (build_instance_masks, compute_pq, load_coco_annotations,
+                                     match_instances, mask_to_rle, relabel_sequential)
 
 
 def two_instances() -> np.ndarray:
@@ -45,3 +49,26 @@ def test_relabel_preserves_adjacent_watershed_instances() -> None:
     # Labels 7 and 19 deliberately touch. A binary re-label would merge them; sequential remapping must not.
     watershed_labels = np.array([[0, 7, 7, 19, 19]], dtype=np.int32)
     assert np.array_equal(relabel_sequential(watershed_labels), np.array([[0, 1, 1, 2, 2]], dtype=np.int32))
+
+
+def test_string_ids_and_polygon_rasterization(tmp_path) -> None:
+    payload = {
+        "images": [{"id": "annotator-A_20260101000000Bh", "width": 2048, "height": 2048, "file_name": "20260101000000Bh.jpeg"}],
+        "annotations": [{"id": "0e4dc87e-4f5d-4ebb-a1f6-123456789abc", "image_id": "annotator-A_20260101000000Bh", "category_id": 1,
+                         "segmentation": [[10.5, 10.5, 30.5, 10.5, 30.5, 30.5, 10.5, 30.5]], "area": 400.0,
+                         "bbox": [10.5, 10.5, 20.0, 20.0], "iscrowd": 0}], "categories": [{"id": 1, "name": "Left"}],
+    }
+    annotation_path = tmp_path / "annotations.json"; annotation_path.write_text(json.dumps(payload))
+    index = load_coco_annotations(annotation_path)
+    image_id = "annotator-A_20260101000000Bh"
+    assert isinstance(next(iter(index.images)), str)
+    assert index.annotations_by_image[image_id][0].annotation_id == "0e4dc87e-4f5d-4ebb-a1f6-123456789abc"
+    mask = build_instance_masks(index, image_id)[0]
+    assert mask.shape == (2048, 2048) and mask.any()
+
+
+def test_rle_round_trip() -> None:
+    mask = np.zeros((8, 9), dtype=bool); mask[2:6, 3:7] = True
+    encoded = coco_mask.encode(np.asfortranarray(mask.astype(np.uint8)))
+    assert isinstance(mask_to_rle(mask), str)
+    assert np.array_equal(coco_mask.decode(encoded).astype(bool), mask)
