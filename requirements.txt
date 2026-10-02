@@ -1,0 +1,11 @@
+# Versions validated against the Kaggle Python image used for this pipeline.
+numpy==1.26.4
+pandas==2.2.3
+Pillow==10.4.0
+scikit-image==0.24.0
+scikit-learn==1.5.2
+opencv-python-headless==4.10.0.84
+matplotlib==3.7.5
+pycocotools==2.0.8
+torch==2.5.1
+torchvision==0.20.1
