@@ -17,10 +17,17 @@ payload is not retained. All final masks originate from trained model inference.
 ## Usage
 
 Attach the competition input in Kaggle, install the pinned requirements when
-needed, and run the notebook from top to bottom. The notebook first discovers
-the files beneath `/kaggle/input`, prints dataset/annotation statistics, and
-uses an observation-grouped validation split. It writes only model-derived
+needed, and run the notebook from top to bottom. Its first executable cell
+finds the repository source from either the current checkout or Kaggle working
+storage and adds it to `sys.path` before testing the `solar_filament` import.
+It then discovers the files beneath `/kaggle/input`, renders 20 annotation
+overlays, prints dataset/annotation statistics and measured class imbalance,
+and uses an observation-grouped validation split. It writes only model-derived
 artifacts to `/kaggle/working` after a checkpoint has been trained and measured.
+
+The final run uses all training observations (`max_train_images=None`) and has
+explicit `RUN_TRAINING`, `RUN_VALIDATION`, and `RUN_TEST_INFERENCE` controls.
+`DEBUG_MODE=True` is the only path that uses a small subset or shorter run.
 
 No metric in this repository is a claimed leaderboard result. Validation Dice,
 IoU, and PQ are deliberately produced only by the validation workflow on the

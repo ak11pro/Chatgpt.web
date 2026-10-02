@@ -14,7 +14,7 @@ import time
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Sequence
+from typing import Any, Iterable, Sequence
 
 import cv2
 import numpy as np
@@ -43,6 +43,8 @@ class PipelineConfig:
     image_size: int = 2048
     train_tile_size: int = 768
     tile_overlap: float = 0.35
+    inference_batch_size: int = 4
+    weighted_tile_blending: bool = True
     in_channels: int = 1
     encoder: str = "resnet34"
     pretrained_encoder: bool = True
@@ -59,11 +61,16 @@ class PipelineConfig:
     morphology_kernel: int = 0
     watershed: bool = True
     watershed_peak_distance: int = 18
+    boundary_mode: str = "guidance"  # disabled, guidance, separator
+    boundary_threshold: float = 0.65
     boundary_head: bool = True
     use_tta: bool = False
     tta_mode: str = "light"
     debug_mode: bool = False
     max_train_images: int | None = None
+    positive_probability: float = 0.50
+    hard_negative_probability: float = 0.25
+    random_probability: float = 0.25
     loss_weights: dict[str, float] = field(default_factory=lambda: {
         "bce": 0.35, "dice": 0.45, "tversky": 0.20, "boundary": 0.20,
     })
@@ -255,9 +262,39 @@ class SolarFilamentDataset(Dataset[dict[str, Tensor]]):
     def __init__(self, index: CocoIndex, image_dir: Path, image_ids: Sequence[int], config: PipelineConfig,
                  training: bool) -> None:
         self.index, self.image_dir, self.image_ids, self.config, self.training = index, image_dir, list(image_ids), config, training
+        total = config.positive_probability + config.hard_negative_probability + config.random_probability
+        if training and not np.isclose(total, 1.0):
+            raise ValueError("Crop sampling probabilities must sum to one")
+        self._sampling_counts: dict[str, int] = defaultdict(int)
+        self.positive_centers: dict[int, np.ndarray] = {}
+        self.hard_negative_centers: dict[int, np.ndarray] = {}
+        if training:
+            self._build_crop_candidates()
 
     def __len__(self) -> int:
         return len(self.image_ids) * (4 if self.training else 1)
+
+    def _build_crop_candidates(self) -> None:
+        """Create train-only positive and high-texture empty locations once."""
+        for image_id in self.image_ids:
+            meta = self.index.images[image_id]
+            image = np.asarray(Image.open(self.image_dir / meta["file_name"]).convert("L"))
+            labels = build_instance_id_mask(self.index, image_id)
+            positive = np.argwhere(labels > 0)
+            self.positive_centers[image_id] = positive[::max(1, len(positive) // 2048)]
+            gradient = np.abs(cv2.Laplacian(robust_normalize(image), cv2.CV_32F))
+            stride, half = max(32, self.config.train_tile_size // 4), self.config.train_tile_size // 2
+            candidates: list[tuple[int, int]] = []
+            for y in range(half, max(half + 1, image.shape[0] - half), stride):
+                for x in range(half, max(half + 1, image.shape[1] - half), stride):
+                    crop = labels[max(0, y-half):min(labels.shape[0], y+half), max(0, x-half):min(labels.shape[1], x+half)]
+                    if not crop.any() and gradient[y, x] >= np.percentile(gradient, 75):
+                        candidates.append((y, x))
+            self.hard_negative_centers[image_id] = np.asarray(candidates, dtype=np.int32).reshape(-1, 2)
+
+    def sampling_distribution(self) -> dict[str, float]:
+        total = sum(self._sampling_counts.values())
+        return {name: count / total for name, count in self._sampling_counts.items()} if total else {}
 
     def __getitem__(self, item: int) -> dict[str, Tensor]:
         image_id = self.image_ids[item % len(self.image_ids)]
@@ -265,7 +302,7 @@ class SolarFilamentDataset(Dataset[dict[str, Tensor]]):
         image = np.asarray(Image.open(self.image_dir / meta["file_name"]).convert("L"))
         instance_ids = build_instance_id_mask(self.index, image_id)
         if self.training:
-            image, instance_ids = self._sample_crop(image, instance_ids)
+            image, instance_ids = self._sample_crop(image, instance_ids, image_id)
             if random.random() < .5:
                 image, instance_ids = np.fliplr(image).copy(), np.fliplr(instance_ids).copy()
             if random.random() < .5:
@@ -278,19 +315,41 @@ class SolarFilamentDataset(Dataset[dict[str, Tensor]]):
                 "boundary": torch.from_numpy(boundary_target(instance_ids)[None].astype(np.float32)),
                 "instance_ids": torch.from_numpy(instance_ids), "image_id": torch.tensor(image_id)}
 
-    def _sample_crop(self, image: np.ndarray, labels: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    def _sample_crop(self, image: np.ndarray, labels: np.ndarray, image_id: int) -> tuple[np.ndarray, np.ndarray]:
         size = self.config.train_tile_size
         pad_h, pad_w = max(0, size - image.shape[0]), max(0, size - image.shape[1])
         image, labels = np.pad(image, ((0, pad_h), (0, pad_w))), np.pad(labels, ((0, pad_h), (0, pad_w)))
-        positive = np.argwhere(labels > 0)
-        # 50% positive, 25% known empty/hard-negative, 25% fully random.
-        if len(positive) and random.random() < .5:
+        draw = random.random()
+        positive = self.positive_centers.get(image_id, np.argwhere(labels > 0))
+        hard_negative = self.hard_negative_centers.get(image_id, np.empty((0, 2), dtype=np.int32))
+        if len(positive) and draw < self.config.positive_probability:
+            self._sampling_counts["positive"] += 1
             y, x = positive[random.randrange(len(positive))]
             top, left = y - random.randrange(size), x - random.randrange(size)
+        elif len(hard_negative) and draw < self.config.positive_probability + self.config.hard_negative_probability:
+            self._sampling_counts["hard_negative"] += 1
+            y, x = hard_negative[random.randrange(len(hard_negative))]
+            top, left = y - size // 2, x - size // 2
         else:
+            self._sampling_counts["random"] += 1
             top, left = random.randrange(image.shape[0] - size + 1), random.randrange(image.shape[1] - size + 1)
         top, left = np.clip(top, 0, image.shape[0] - size), np.clip(left, 0, image.shape[1] - size)
         return image[top:top + size, left:left + size], labels[top:top + size, left:left + size]
+
+
+def build_encoder(pretrained: bool = True) -> tuple[nn.Module, bool]:
+    """Load cached ImageNet weights when available, with an explicit offline fallback."""
+    if not pretrained:
+        print("Pretrained encoder loaded: NO (disabled by configuration)")
+        return resnet34(weights=None), False
+    try:
+        encoder = resnet34(weights=ResNet34_Weights.IMAGENET1K_V1)
+        print("Pretrained encoder loaded: YES")
+        return encoder, True
+    except Exception as error:
+        LOGGER.warning("Could not load pretrained ResNet-34 weights; using random initialization: %s", error)
+        print("Pretrained encoder loaded: NO (weights unavailable)")
+        return resnet34(weights=None), False
 
 
 class FilamentSegmentationModel(nn.Module):
@@ -298,8 +357,7 @@ class FilamentSegmentationModel(nn.Module):
 
     def __init__(self, config: PipelineConfig) -> None:
         super().__init__()
-        weights = ResNet34_Weights.IMAGENET1K_V1 if config.pretrained_encoder else None
-        encoder = resnet34(weights=weights)
+        encoder, self.pretrained_loaded = build_encoder(config.pretrained_encoder)
         if config.in_channels != 3:
             old = encoder.conv1
             encoder.conv1 = nn.Conv2d(config.in_channels, 64, 7, 2, 3, bias=False)
@@ -359,14 +417,41 @@ def compute_segmentation_metrics(pred: np.ndarray, truth: np.ndarray) -> dict[st
 
 
 def compute_instance_iou_matrix(pred_ids: np.ndarray, truth_ids: np.ndarray) -> np.ndarray:
-    p_labels, g_labels = np.unique(pred_ids)[1:], np.unique(truth_ids)[1:]
-    matrix = np.zeros((len(g_labels), len(p_labels)), dtype=float)
-    for gi, g in enumerate(g_labels):
-        for pi, p in enumerate(p_labels):
-            intersection = np.logical_and(truth_ids == g, pred_ids == p).sum()
-            union = np.logical_or(truth_ids == g, pred_ids == p).sum()
-            matrix[gi, pi] = intersection / union if union else 0
-    return matrix
+    """Vectorized pair histogram; scans the image once rather than per object pair."""
+    if pred_ids.shape != truth_ids.shape:
+        raise ValueError("Prediction and ground-truth label maps must have identical shapes")
+    gt_labels, gt_inverse = np.unique(truth_ids, return_inverse=True)
+    pred_labels, pred_inverse = np.unique(pred_ids, return_inverse=True)
+    # Labels are compacted locally, so arbitrary COCO/source labels are safe.
+    overlap = np.bincount(
+        gt_inverse * len(pred_labels) + pred_inverse,
+        minlength=len(gt_labels) * len(pred_labels),
+    ).reshape(len(gt_labels), len(pred_labels))
+    gt_foreground = gt_labels > 0
+    pred_foreground = pred_labels > 0
+    intersections = overlap[np.ix_(gt_foreground, pred_foreground)].astype(np.float64)
+    gt_area = overlap[gt_foreground, :].sum(axis=1, dtype=np.float64)[:, None]
+    pred_area = overlap[:, pred_foreground].sum(axis=0, dtype=np.float64)[None, :]
+    union = gt_area + pred_area - intersections
+    return np.divide(intersections, union, out=np.zeros_like(intersections), where=union > 0)
+
+
+def benchmark_instance_iou(shape: tuple[int, int] = (2048, 2048), instances: int = 24) -> dict[str, float]:
+    """Compare the vectorized pair histogram against the former pairwise reference."""
+    rng = np.random.default_rng(123)
+    truth = rng.integers(0, instances + 1, shape, dtype=np.int16)
+    prediction = rng.integers(0, instances + 1, shape, dtype=np.int16)
+    started = time.perf_counter(); fast = compute_instance_iou_matrix(prediction, truth); fast_seconds = time.perf_counter() - started
+    started = time.perf_counter()
+    slow = np.zeros_like(fast)
+    for gt in range(1, instances + 1):
+        for pred in range(1, instances + 1):
+            intersection = np.count_nonzero((truth == gt) & (prediction == pred))
+            union = np.count_nonzero((truth == gt) | (prediction == pred))
+            slow[gt - 1, pred - 1] = intersection / union if union else 0
+    slow_seconds = time.perf_counter() - started
+    assert np.allclose(fast, slow)
+    return {"vectorized_seconds": fast_seconds, "pairwise_seconds": slow_seconds, "speedup": slow_seconds / max(fast_seconds, 1e-12)}
 
 
 def match_instances(iou: np.ndarray, threshold: float = .5) -> list[tuple[int, int, float]]:
@@ -374,7 +459,7 @@ def match_instances(iou: np.ndarray, threshold: float = .5) -> list[tuple[int, i
     matches: list[tuple[int, int, float]] = []
     for flat in np.argsort(iou.ravel())[::-1]:
         g, p = np.unravel_index(flat, iou.shape)
-        if iou[g, p] < threshold: break
+        if iou[g, p] <= threshold: break
         if g not in [x[0] for x in matches] and p not in [x[1] for x in matches]: matches.append((g, p, float(iou[g, p])))
     return matches
 
@@ -392,27 +477,41 @@ def compute_pq(pred_ids: np.ndarray, truth_ids: np.ndarray, threshold: float = .
             "one_to_many": one_to_many, "many_to_one": many_to_one}
 
 
+def relabel_sequential(labels: np.ndarray) -> np.ndarray:
+    """Compact surviving instance IDs while preserving watershed separations."""
+    result = np.zeros_like(labels, dtype=np.int32)
+    unique = np.unique(labels)
+    for new, old in enumerate(unique[unique > 0], start=1):
+        result[labels == old] = new
+    return result
+
+
 def reconstruct_instances(probability: np.ndarray, config: PipelineConfig, boundary_probability: np.ndarray | None = None,
                           disk_mask: np.ndarray | None = None) -> np.ndarray:
     binary = probability >= config.threshold
     if disk_mask is not None: binary &= disk_mask
-    if boundary_probability is not None: binary &= boundary_probability < .65
+    # Boundary prediction guides marker placement or optional separator bands; it never erases all boundary pixels.
+    separator = None
+    if boundary_probability is not None and config.boundary_mode == "separator":
+        separator = boundary_probability >= config.boundary_threshold
     if config.morphology_kernel > 1:
         kernel = np.ones((config.morphology_kernel, config.morphology_kernel), np.uint8)
         binary = cv2.morphologyEx(binary.astype(np.uint8), cv2.MORPH_CLOSE, kernel).astype(bool)
     if config.watershed and binary.any():
         distance = ndi.distance_transform_edt(binary)
+        if boundary_probability is not None and config.boundary_mode == "guidance":
+            distance = distance * (1.0 - 0.5 * boundary_probability)
+        watershed_mask = binary & ~separator if separator is not None else binary
         peaks = peak_local_max(distance, min_distance=config.watershed_peak_distance, labels=binary)
         markers = np.zeros(binary.shape, dtype=np.int32)
         for label, (y, x) in enumerate(peaks, 1): markers[y, x] = label
         markers, _ = ndi.label(markers)
-        labels = watershed(-distance, markers, mask=binary) if markers.max() else ndi.label(binary)[0]
+        labels = watershed(-distance, markers, mask=watershed_mask) if markers.max() else ndi.label(binary)[0]
     else:
         labels, _ = ndi.label(binary)
     for label in np.unique(labels)[1:]:
         if (labels == label).sum() < config.min_component_area: labels[labels == label] = 0
-    labels, _ = ndi.label(labels > 0)
-    return labels.astype(np.int32)
+    return relabel_sequential(labels)
 
 
 def tile_starts(length: int, tile: int, overlap: float) -> list[int]:
@@ -422,25 +521,41 @@ def tile_starts(length: int, tile: int, overlap: float) -> list[int]:
 
 @torch.inference_mode()
 def predict_tiled(model: nn.Module, image: np.ndarray, config: PipelineConfig, device: torch.device) -> tuple[np.ndarray, np.ndarray | None]:
-    """Full-resolution overlap-blended inference; no resize to a destructive 256 px."""
+    """Batched, overlap-blended full-resolution inference with optional light TTA."""
     image = robust_normalize(image); h, w = image.shape; tile = config.train_tile_size
     sums, counts, boundary_sums = np.zeros((h, w), np.float32), np.zeros((h, w), np.float32), np.zeros((h, w), np.float32)
+    window_1d = np.hanning(tile).astype(np.float32)
+    blend_window = np.outer(window_1d, window_1d) + 0.05 if config.weighted_tile_blending else np.ones((tile, tile), np.float32)
+    pending: list[tuple[np.ndarray, int, int, int, int, str]] = []
+    transforms = ["identity"] + (["horizontal", "vertical"] if config.use_tta and config.tta_mode == "light" else [])
+
+    def flush() -> None:
+        if not pending:
+            return
+        batch = torch.from_numpy(np.stack([entry[0] for entry in pending])[:, None]).float().to(device)
+        output = model(batch)
+        semantic = output["semantic"].sigmoid().cpu().numpy()[:, 0]
+        boundary = output["boundary"].sigmoid().cpu().numpy()[:, 0]
+        for prediction, boundary_prediction, (_, y, x, oh, ow, transform) in zip(semantic, boundary, pending):
+            if transform == "horizontal": prediction, boundary_prediction = np.fliplr(prediction), np.fliplr(boundary_prediction)
+            if transform == "vertical": prediction, boundary_prediction = np.flipud(prediction), np.flipud(boundary_prediction)
+            weight = blend_window[:oh, :ow]
+            sums[y:y + oh, x:x + ow] += prediction[:oh, :ow] * weight
+            boundary_sums[y:y + oh, x:x + ow] += boundary_prediction[:oh, :ow] * weight
+            counts[y:y + oh, x:x + ow] += weight
+        pending.clear()
+
     model.eval()
     for y in tile_starts(h, tile, config.tile_overlap):
         for x in tile_starts(w, tile, config.tile_overlap):
             crop = image[y:y + tile, x:x + tile]; original_h, original_w = crop.shape
             crop = np.pad(crop, ((0, tile - original_h), (0, tile - original_w)))
-            transforms = [(crop, lambda a: a)]
-            if config.use_tta: transforms += [(np.fliplr(crop).copy(), lambda a: np.fliplr(a))]
-            semantic, boundary = 0.0, 0.0
-            for transformed, inverse in transforms:
-                output = model(torch.from_numpy(transformed[None, None]).float().to(device))
-                semantic += inverse(output["semantic"].sigmoid().cpu().numpy()[0, 0])
-                boundary += inverse(output["boundary"].sigmoid().cpu().numpy()[0, 0])
-            semantic, boundary = semantic / len(transforms), boundary / len(transforms)
-            sums[y:y + original_h, x:x + original_w] += semantic[:original_h, :original_w]
-            boundary_sums[y:y + original_h, x:x + original_w] += boundary[:original_h, :original_w]
-            counts[y:y + original_h, x:x + original_w] += 1
+            for transform in transforms:
+                transformed = np.fliplr(crop).copy() if transform == "horizontal" else np.flipud(crop).copy() if transform == "vertical" else crop
+                pending.append((transformed, y, x, original_h, original_w, transform))
+                if len(pending) == config.inference_batch_size:
+                    flush()
+    flush()
     return sums / counts, boundary_sums / counts if config.boundary_head else None
 
 
@@ -459,21 +574,26 @@ def create_submission(model: nn.Module, data: CompetitionData, config: PipelineC
                       device: torch.device) -> pd.DataFrame:
     rows: list[dict[str, str]] = []
     per_image: list[int] = []
+    empty_observations: list[str] = []
     for path in list_image_files(data.test_images):
         image = np.asarray(Image.open(path).convert("L")); probability, boundary = predict_tiled(model, image, config, device)
         labels = reconstruct_instances(probability, config, boundary, detect_solar_disk(image))
         count = 0
         for label in np.unique(labels)[1:]:
             mask = labels == label
+            assert mask.shape == image.shape, "Predicted mask dimensions changed during inference"
             validate_rle(mask)
             rows.append({"filament_id": f"{path.stem}_{label}", "segmentation_rle": mask_to_rle(mask)})
             count += 1
         per_image.append(count)
+        if count == 0:
+            empty_observations.append(path.stem)
     submission = pd.DataFrame(rows, columns=["filament_id", "segmentation_rle"])
     assert submission.filament_id.is_unique and not submission.isna().any().any()
     submission.to_csv(output_path, index=False)
     print({"test_observations": len(per_image), "submission_rows": len(submission), "predicted_instances": sum(per_image),
-           "average_instances_image": float(np.mean(per_image)) if per_image else 0, "min_instances_image": min(per_image, default=0), "max_instances_image": max(per_image, default=0)})
+           "average_instances_image": float(np.mean(per_image)) if per_image else 0, "min_instances_image": min(per_image, default=0), "max_instances_image": max(per_image, default=0),
+           "empty_detection_observations": empty_observations})
     return submission
 
 
@@ -481,10 +601,16 @@ def run_synthetic_metric_tests() -> None:
     truth = np.zeros((10, 10), np.int32); truth[1:4, 1:4] = 1; truth[6:9, 6:9] = 2
     perfect = truth.copy(); result = compute_pq(perfect, truth)
     assert result["pq"] == 1 and result["tp"] == 2 and result["fp"] == result["fn"] == 0
+    fp = truth.copy(); fp[1:3, 6:8] = 3
+    assert compute_pq(fp, truth)["fp"] == 1
+    fn = truth.copy(); fn[6:9, 6:9] = 0
+    assert compute_pq(fn, truth)["fn"] == 1
     merged = np.where(truth > 0, 1, 0); result = compute_pq(merged, truth)
     assert result["many_to_one"] == 1 and result["pq"] < 1
     split = truth.copy(); split[1:4, 2] = 0; labels, _ = ndi.label(split > 0); result = compute_pq(labels, truth)
-    assert result["one_to_many"] >= 1
+    assert result["one_to_many"] >= 1 and result["pq"] < 1
+    assert not match_instances(np.array([[.5]]))
+    assert match_instances(np.array([[.500001]]))
 
 
 def environment_report(config: PipelineConfig) -> dict[str, Any]:
@@ -529,32 +655,73 @@ def validate(model: nn.Module, dataset: SolarFilamentDataset, config: PipelineCo
     result["global_sq"] = totals["matched_iou_sum"] / max(totals["tp"], 1)
     result["global_rq"] = totals["tp"] / denom if denom else 1.0
     result["global_pq"] = result["global_sq"] * result["global_rq"]
+    # Explicit aliases prevent accidentally comparing mean image PQ with global dataset PQ.
+    result["mean_image_pq"] = result["pq"]
+    result["mean_dice"] = result["dice"]
+    result["mean_iou"] = result["iou"]
     return result
+
+
+@torch.inference_mode()
+def cache_validation_predictions(model: nn.Module, dataset: SolarFilamentDataset, config: PipelineConfig,
+                                 device: torch.device, cache_dir: str | Path) -> list[tuple[np.ndarray, np.ndarray | None, np.ndarray]]:
+    """Persist full-resolution validation outputs so post-processing never re-runs the model."""
+    destination = Path(cache_dir); destination.mkdir(parents=True, exist_ok=True)
+    cached: list[tuple[np.ndarray, np.ndarray | None, np.ndarray]] = []
+    for image_id in dataset.image_ids:
+        path = destination / f"{image_id}.npz"
+        if path.exists():
+            loaded = np.load(path)
+            boundary = loaded["boundary"] if "boundary" in loaded.files else None
+            cached.append((loaded["semantic"], boundary, loaded["truth"]))
+            continue
+        meta = dataset.index.images[image_id]
+        image = np.asarray(Image.open(dataset.image_dir / meta["file_name"]).convert("L"))
+        semantic, boundary = predict_tiled(model, image, config, device)
+        truth = build_instance_id_mask(dataset.index, image_id)
+        payload: dict[str, np.ndarray] = {"semantic": semantic, "truth": truth}
+        if boundary is not None: payload["boundary"] = boundary
+        np.savez_compressed(path, **payload)
+        cached.append((semantic, boundary, truth))
+    return cached
 
 
 def optimize_postprocessing(probabilities: Iterable[np.ndarray], boundaries: Iterable[np.ndarray | None],
                             truths: Iterable[np.ndarray], base: PipelineConfig) -> tuple[PipelineConfig, pd.DataFrame]:
-    """Small PQ-first search, intentionally avoiding an unbounded validation grid."""
+    """Staged PQ-first search over cached maps; every evaluated setting is retained."""
     cached = list(zip(probabilities, boundaries, truths)); rows: list[dict[str, float]] = []
-    candidates = [(threshold, area, watershed) for threshold in (.25, .35, .40, .50, .60)
-                  for area in (20, 50, 100, 200) for watershed in (False, True)]
-    for threshold, area, watershed_enabled in candidates:
-        candidate = PipelineConfig(**{**asdict(base), "threshold": threshold, "min_component_area": area, "watershed": watershed_enabled})
-        values = [compute_pq(reconstruct_instances(p, candidate, b), truth) for p, b, truth in cached]
+    def evaluate(stage: str, update: dict[str, Any]) -> PipelineConfig:
+        candidate = PipelineConfig(**{**asdict(base), **update})
+        panoptic = [compute_pq(reconstruct_instances(p, candidate, b), truth) for p, b, truth in cached]
         semantic = [compute_segmentation_metrics(reconstruct_instances(p, candidate, b) > 0, truth > 0) for p, b, truth in cached]
-        rows.append({"threshold": threshold, "min_component_area": area, "watershed": watershed_enabled,
-                     "pq": float(np.mean([x["pq"] for x in values])), "dice": float(np.mean([x["dice"] for x in semantic])),
-                     "iou": float(np.mean([x["iou"] for x in semantic]))})
-    table = pd.DataFrame(rows).sort_values(["pq", "dice"], ascending=False).reset_index(drop=True)
-    best = table.iloc[0].to_dict()
-    return PipelineConfig(**{**asdict(base), "threshold": float(best["threshold"]), "min_component_area": int(best["min_component_area"]), "watershed": bool(best["watershed"])}), table
+        rows.append({"stage": stage, **update, "mean_pq": float(np.mean([x["pq"] for x in panoptic])),
+                     "mean_dice": float(np.mean([x["dice"] for x in semantic])), "mean_iou": float(np.mean([x["iou"] for x in semantic]))})
+        return candidate
+    # Stage 1 selects semantic threshold and whether to split. Later stages refine the winner only.
+    stage1 = [evaluate("threshold_watershed", {"threshold": threshold, "watershed": watershed_enabled})
+              for threshold in (.20, .25, .30, .35, .40, .45, .50, .55, .60, .65) for watershed_enabled in (False, True)]
+    best = max(zip(stage1, rows), key=lambda item: (item[1]["mean_pq"], item[1]["mean_dice"]))[0]
+    stage2 = [evaluate("min_area", {**asdict(best), "min_component_area": area}) for area in (10, 20, 50, 100, 200, 500)]
+    best = max(zip(stage2, rows[-len(stage2):]), key=lambda item: (item[1]["mean_pq"], item[1]["mean_dice"]))[0]
+    stage3 = [evaluate("peak_distance", {**asdict(best), "watershed_peak_distance": distance}) for distance in (8, 12, 16, 20, 24, 32)] if best.watershed else [best]
+    best = max(zip(stage3, rows[-len(stage3):]), key=lambda item: (item[1]["mean_pq"], item[1]["mean_dice"]))[0]
+    stage4 = [evaluate("boundary", {**asdict(best), "boundary_mode": mode, "boundary_threshold": threshold})
+              for mode in ("disabled", "guidance", "separator") for threshold in (.55, .65, .75)]
+    best = max(zip(stage4, rows[-len(stage4):]), key=lambda item: (item[1]["mean_pq"], item[1]["mean_dice"]))[0]
+    stage5 = [evaluate("morphology", {**asdict(best), "morphology_kernel": kernel}) for kernel in (0, 1, 2, 3, 5)]
+    best = max(zip(stage5, rows[-len(stage5):]), key=lambda item: (item[1]["mean_pq"], item[1]["mean_dice"]))[0]
+    table = pd.DataFrame(rows).sort_values(["mean_pq", "mean_dice"], ascending=False).reset_index(drop=True)
+    return best, table
 
 
-def append_experiment(path: str | Path, name: str, config: PipelineConfig, metrics: dict[str, float], runtime_seconds: float) -> None:
+def append_experiment(path: str | Path, name: str, config: PipelineConfig, metrics: dict[str, float], runtime_seconds: float,
+                      pos_weight: float) -> None:
     """Append measured results only; callers must never insert claimed scores."""
-    row = {"experiment": name, "architecture": "resnet34_unet_boundary", "input_resolution": config.train_tile_size,
-           "loss": json.dumps(config.loss_weights, sort_keys=True), "epochs": config.epochs, "threshold": config.threshold,
-           "postprocessing": f"watershed={config.watershed};min_area={config.min_component_area}", "runtime_seconds": runtime_seconds,
-           **metrics}
+    row = {"experiment": name, "architecture": "resnet34_unet", "encoder": config.encoder,
+           "pretrained": config.pretrained_encoder, "tile_size": config.train_tile_size, "epochs": config.epochs,
+           "batch_size": config.batch_size, "learning_rate": config.learning_rate, "loss": json.dumps(config.loss_weights, sort_keys=True),
+           "pos_weight": pos_weight, "threshold": config.threshold, "min_area": config.min_component_area,
+           "watershed": config.watershed, "peak_distance": config.watershed_peak_distance, "boundary_mode": config.boundary_mode,
+           "tta": config.use_tta, "runtime_seconds": runtime_seconds, **metrics}
     destination = Path(path); previous = pd.read_csv(destination) if destination.exists() else pd.DataFrame()
     pd.concat([previous, pd.DataFrame([row])], ignore_index=True).to_csv(destination, index=False)
