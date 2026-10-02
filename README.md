@@ -16,17 +16,20 @@ payload is not retained. All final masks originate from trained model inference.
 
 ## Usage
 
-Attach the competition input in Kaggle, install the pinned requirements when
-needed, and run the notebook from top to bottom. Its first executable cell
-finds the repository source from either the current checkout or Kaggle working
-storage and adds it to `sys.path` before testing the `solar_filament` import.
-It then discovers the files beneath `/kaggle/input`, renders 20 annotation
-overlays, prints dataset/annotation statistics and measured class imbalance,
-and uses an observation-grouped validation split. It writes only model-derived
+Attach the competition input in Kaggle, enable Internet access, and run the notebook from top to bottom. Its first executable cell
+clones the public GitHub branch `codex/audit-provided-notebook-for-weaknesses`
+into `/kaggle/working/Chatgpt.web`, adds that checkout to `sys.path`, and prints
+the exact Git commit used by the run. The notebook never stores a duplicate
+copy of `solar_filament/pipeline.py`; the repository checkout is the source of
+truth. It then discovers the files beneath `/kaggle/input`, renders 20
+annotation overlays, prints dataset/annotation statistics and measured class
+imbalance, and uses an observation-grouped validation split. It writes only model-derived
 artifacts to `/kaggle/working` after a checkpoint has been trained and measured.
 
 The final run uses all training observations (`max_train_images=None`) and has
 explicit `RUN_TRAINING`, `RUN_VALIDATION`, and `RUN_TEST_INFERENCE` controls.
+The GitHub clone requires Kaggle Internet access; the competition dataset itself
+remains attached from Kaggle Inputs.
 `DEBUG_MODE=True` is the only path that uses a small subset or shorter run.
 
 No metric in this repository is a claimed leaderboard result. Validation Dice,
