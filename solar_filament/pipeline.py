@@ -930,9 +930,21 @@ def optimize_postprocessing(probabilities: Iterable[np.ndarray], boundaries: Ite
                             truths: Iterable[np.ndarray], base: PipelineConfig,
                             disk_masks: Iterable[np.ndarray] | None = None) -> tuple[PipelineConfig, pd.DataFrame]:
     """Staged PQ-first search over cached maps; every evaluated setting is retained."""
+    probabilities = list(probabilities)
+    boundaries = list(boundaries)
+    truths = list(truths)
+    if not (len(probabilities) == len(boundaries) == len(truths)):
+        raise ValueError("Probability, boundary, and truth caches must have equal lengths")
     if disk_masks is None:
-        disk_masks = (None for _ in truths)
-    cached = list(zip(probabilities, boundaries, truths, disk_masks)); rows: list[dict[str, float]] = []
+        disk_masks = [None] * len(truths)
+    else:
+        disk_masks = list(disk_masks)
+    if len(disk_masks) != len(truths):
+        raise ValueError("Disk-mask cache length does not match truth cache")
+    cached = list(zip(probabilities, boundaries, truths, disk_masks))
+    if not cached:
+        raise ValueError("Cannot optimize post-processing with an empty validation cache")
+    rows: list[dict[str, float]] = []
     def evaluate(stage: str, update: dict[str, Any]) -> PipelineConfig:
         candidate = PipelineConfig(**{**asdict(base), **update})
         panoptic = [compute_pq(reconstruct_instances(p, candidate, b, d), truth)
