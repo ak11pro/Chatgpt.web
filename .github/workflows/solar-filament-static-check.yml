@@ -1,0 +1,51 @@
+name: Solar filament notebook static checks
+
+on:
+  push:
+    branches:
+      - codex/audit-provided-notebook-for-weaknesses
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  python-syntax:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Parse pipeline and every notebook code cell
+        run: |
+          python - <<'PY'
+          import ast
+          import json
+          from pathlib import Path
+
+          pipeline = Path("solar_filament/pipeline.py")
+          ast.parse(pipeline.read_text(encoding="utf-8"), filename=str(pipeline))
+
+          notebook_path = Path("solar-filament-final-kaggle.ipynb")
+          notebook = json.loads(notebook_path.read_text(encoding="utf-8"))
+          assert notebook.get("nbformat") == 4
+          code_cells = 0
+          for index, cell in enumerate(notebook.get("cells", [])):
+              if cell.get("cell_type") != "code":
+                  continue
+              source = "".join(cell.get("source", []))
+              ast.parse(source, filename=f"{notebook_path.name}:cell-{index}")
+              code_cells += 1
+
+          original = Path("solar-filament-unet-segmentation-0-55.ipynb")
+          if original.exists():
+              old = json.loads(original.read_text(encoding="utf-8"))
+              old_code = "\n".join(
+                  "".join(cell.get("source", []))
+                  for cell in old.get("cells", [])
+                  if cell.get("cell_type") == "code"
+              )
+              assert "CHAMPION_PAYLOAD" not in old_code, "Legacy precomputed test payload has returned."
+
+          print(f"PASS: pipeline syntax; notebook JSON; {code_cells} notebook code cells parsed.")
+          PY
