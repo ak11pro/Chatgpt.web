@@ -901,19 +901,32 @@ def cache_validation_predictions(model: nn.Module, dataset: SolarFilamentDataset
     """Persist full-resolution validation outputs and disk masks so post-processing matches final inference."""
     destination = Path(cache_dir); destination.mkdir(parents=True, exist_ok=True)
     cached: list[tuple[np.ndarray, np.ndarray | None, np.ndarray, np.ndarray]] = []
+    predictions_by_stem: dict[str, tuple[np.ndarray, np.ndarray | None, np.ndarray]] = {}
     for image_id in dataset.image_ids:
         path = destination / f"{image_id}.npz"
-        if path.exists():
-            loaded = np.load(path)
-            boundary = loaded["boundary"] if "boundary" in loaded.files else None
-            disk = loaded["disk"] if "disk" in loaded.files else np.ones(loaded["truth"].shape, dtype=bool)
-            cached.append((loaded["semantic"], boundary, loaded["truth"], disk))
-            continue
         meta = dataset.index.images[image_id]
-        image = np.asarray(Image.open(dataset.image_dir / meta["file_name"]).convert("L"))
-        semantic, boundary = predict_tiled(model, image, config, device)
+        stem = Path(str(meta["file_name"])).stem
+        if path.exists():
+            with np.load(path, allow_pickle=False) as loaded:
+                semantic = loaded["semantic"]
+                boundary = loaded["boundary"] if "boundary" in loaded.files else None
+                truth = loaded["truth"]
+                disk = loaded["disk"] if "disk" in loaded.files else np.ones(truth.shape, dtype=bool)
+            predictions_by_stem.setdefault(stem, (semantic, boundary, disk))
+            cached.append((semantic, boundary, truth, disk))
+            continue
+
+        if stem in predictions_by_stem:
+            # Multiple annotator entries can point to the exact same JPEG. Reuse
+            # the prediction arrays; each view still receives its own GT mask.
+            semantic, boundary, disk = predictions_by_stem[stem]
+        else:
+            image = np.asarray(Image.open(dataset.image_dir / meta["file_name"]).convert("L"))
+            semantic, boundary = predict_tiled(model, image, config, device)
+            disk = detect_solar_disk(image)
+            predictions_by_stem[stem] = (semantic, boundary, disk)
+
         truth = build_instance_id_mask(dataset.index, image_id)
-        disk = detect_solar_disk(image)
         payload: dict[str, np.ndarray] = {
             "semantic": semantic.astype(np.float32),
             "truth": truth.astype(np.int32),
