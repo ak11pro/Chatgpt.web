@@ -869,14 +869,20 @@ def train_one_epoch(model: nn.Module, loader: DataLoader, optimizer: torch.optim
 
 @torch.inference_mode()
 def validate(model: nn.Module, dataset: SolarFilamentDataset, config: PipelineConfig, device: torch.device) -> dict[str, float]:
-    """Image-level semantic and global PQ validation; no crop leakage is possible."""
+    """Score every annotator view while running the model once per physical JPEG."""
     aggregate: dict[str, list[float]] = defaultdict(list)
     totals: dict[str, float] = defaultdict(float)
+    predictions_by_stem: dict[str, np.ndarray] = {}
     for image_id in dataset.image_ids:
         meta = dataset.index.images[image_id]
-        image = np.asarray(Image.open(dataset.image_dir / meta["file_name"]).convert("L"))
-        probability, boundary = predict_tiled(model, image, config, device)
-        predicted = reconstruct_instances(probability, config, boundary, detect_solar_disk(image))
+        stem = Path(str(meta["file_name"])).stem
+        predicted = predictions_by_stem.get(stem)
+        if predicted is None:
+            image = np.asarray(Image.open(dataset.image_dir / meta["file_name"]).convert("L"))
+            probability, boundary = predict_tiled(model, image, config, device)
+            disk_mask = detect_solar_disk(image)
+            predicted = reconstruct_instances(probability, config, boundary, disk_mask)
+            predictions_by_stem[stem] = predicted
         truth = build_instance_id_mask(dataset.index, image_id)
         semantic = compute_segmentation_metrics(predicted > 0, truth > 0)
         panoptic = compute_pq(predicted, truth)
