@@ -75,10 +75,12 @@ def test_rle_round_trip() -> None:
 
 
 def test_physical_observation_group_split(tmp_path) -> None:
+    # Two annotator IDs share each JPEG, and two different JPEGs share one date.
     payload = {
         "images": [
             {"id": "010101-20260101000000Bh", "width": 2048, "height": 2048, "file_name": "20260101000000Bh.jpeg"},
             {"id": "010102-20260101000000Bh", "width": 2048, "height": 2048, "file_name": "20260101000000Bh.jpeg"},
+            {"id": "010101-20260101120000Bh", "width": 2048, "height": 2048, "file_name": "20260101120000Bh.jpeg"},
             {"id": "010101-20260102000000Bh", "width": 2048, "height": 2048, "file_name": "20260102000000Bh.jpeg"},
             {"id": "010102-20260102000000Bh", "width": 2048, "height": 2048, "file_name": "20260102000000Bh.jpeg"},
         ],
@@ -87,9 +89,11 @@ def test_physical_observation_group_split(tmp_path) -> None:
              "segmentation": [[10, 10, 30, 10, 30, 30, 10, 30]], "area": 400, "bbox": [10, 10, 20, 20], "iscrowd": 0},
             {"id": "a2", "image_id": "010102-20260101000000Bh", "category_id": 1,
              "segmentation": [[12, 12, 32, 12, 32, 32, 12, 32]], "area": 400, "bbox": [12, 12, 20, 20], "iscrowd": 0},
-            {"id": "a3", "image_id": "010101-20260102000000Bh", "category_id": 1,
+            {"id": "a3", "image_id": "010101-20260101120000Bh", "category_id": 1,
+             "segmentation": [[13, 13, 33, 13, 33, 33, 13, 33]], "area": 400, "bbox": [13, 13, 20, 20], "iscrowd": 0},
+            {"id": "a4", "image_id": "010101-20260102000000Bh", "category_id": 1,
              "segmentation": [[14, 14, 34, 14, 34, 34, 14, 34]], "area": 400, "bbox": [14, 14, 20, 20], "iscrowd": 0},
-            {"id": "a4", "image_id": "010102-20260102000000Bh", "category_id": 1,
+            {"id": "a5", "image_id": "010102-20260102000000Bh", "category_id": 1,
              "segmentation": [[16, 16, 36, 16, 36, 36, 16, 36]], "area": 400, "bbox": [16, 16, 20, 20], "iscrowd": 0},
         ],
         "categories": [{"id": 1, "name": "Left"}],
@@ -98,7 +102,12 @@ def test_physical_observation_group_split(tmp_path) -> None:
     path.write_text(json.dumps(payload))
     index = load_coco_annotations(path)
     train_ids, val_ids = group_train_validation_split(index, fraction=0.5, seed=42)
+
     train_files = {index.images[i]["file_name"] for i in train_ids}
     val_files = {index.images[i]["file_name"] for i in val_ids}
+    train_dates = {index.images[i]["file_name"][:8] for i in train_ids}
+    val_dates = {index.images[i]["file_name"][:8] for i in val_ids}
+
+    assert train_ids and val_ids
     assert train_files.isdisjoint(val_files)
-    assert len(train_ids) == len(val_ids) == 2
+    assert train_dates.isdisjoint(val_dates)
