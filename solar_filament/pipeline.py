@@ -935,31 +935,55 @@ def optimize_postprocessing(probabilities: Iterable[np.ndarray], boundaries: Ite
     cached = list(zip(probabilities, boundaries, truths, disk_masks)); rows: list[dict[str, float]] = []
     def evaluate(stage: str, update: dict[str, Any]) -> PipelineConfig:
         candidate = PipelineConfig(**{**asdict(base), **update})
-        panoptic = [compute_pq(reconstruct_instances(p, candidate, b, d), truth) for p, b, truth, d in cached]
-        semantic = [compute_segmentation_metrics(reconstruct_instances(p, candidate, b, d) > 0, truth > 0) for p, b, truth, d in cached]
-        rows.append({"stage": stage, **update, "mean_pq": float(np.mean([x["pq"] for x in panoptic])),
-                     "mean_dice": float(np.mean([x["dice"] for x in semantic])), "mean_iou": float(np.mean([x["iou"] for x in semantic]))})
+        panoptic = [compute_pq(reconstruct_instances(p, candidate, b, d), truth)
+                    for p, b, truth, d in cached]
+        semantic = [
+            compute_segmentation_metrics(reconstruct_instances(p, candidate, b, d) > 0, truth > 0)
+            for p, b, truth, d in cached
+        ]
+        # The organizer's PQ aggregates TP/FP/FN and matched IoU across annotation
+        # views. Optimize that pooled objective; retain mean-image PQ as a diagnostic.
+        total_tp = sum(float(x["tp"]) for x in panoptic)
+        total_fp = sum(float(x["fp"]) for x in panoptic)
+        total_fn = sum(float(x["fn"]) for x in panoptic)
+        total_iou = sum(float(x["matched_iou_sum"]) for x in panoptic)
+        denominator = total_tp + 0.5 * total_fp + 0.5 * total_fn
+        pq_pooled = total_iou / denominator if denominator else 1.0
+        rows.append({
+            "stage": stage,
+            **update,
+            "pq_pooled": float(pq_pooled),
+            "mean_pq": float(np.mean([x["pq"] for x in panoptic])),
+            "mean_dice": float(np.mean([x["dice"] for x in semantic])),
+            "mean_iou": float(np.mean([x["iou"] for x in semantic])),
+            "tp": total_tp,
+            "fp": total_fp,
+            "fn": total_fn,
+            "matched_iou_sum": total_iou,
+            "one_to_many": int(sum(x["one_to_many"] for x in panoptic)),
+            "many_to_one": int(sum(x["many_to_one"] for x in panoptic)),
+        })
         return candidate
     # Stage 1 selects semantic threshold and whether to split. Later stages refine the winner only.
     stage1 = [evaluate("threshold_watershed", {"threshold": threshold, "watershed": watershed_enabled})
               for threshold in (.20, .25, .30, .35, .40, .45, .50, .55, .60, .65) for watershed_enabled in (False, True)]
-    best = max(zip(stage1, rows), key=lambda item: (item[1]["mean_pq"], item[1]["mean_dice"]))[0]
+    best = max(zip(stage1, rows), key=lambda item: (item[1]["pq_pooled"], item[1]["mean_dice"]))[0]
     stage2 = [evaluate("min_area", {**asdict(best), "min_component_area": area}) for area in (10, 20, 50, 100, 200, 500)]
-    best = max(zip(stage2, rows[-len(stage2):]), key=lambda item: (item[1]["mean_pq"], item[1]["mean_dice"]))[0]
+    best = max(zip(stage2, rows[-len(stage2):]), key=lambda item: (item[1]["pq_pooled"], item[1]["mean_dice"]))[0]
     if best.watershed:
         stage3 = [evaluate("peak_distance", {**asdict(best), "watershed_peak_distance": distance})
                   for distance in (8, 12, 16, 20, 24, 32)]
         best = max(zip(stage3, rows[-len(stage3):]),
-                   key=lambda item: (item[1]["mean_pq"], item[1]["mean_dice"]))[0]
+                   key=lambda item: (item[1]["pq_pooled"], item[1]["mean_dice"]))[0]
     stage4 = [evaluate("boundary", {**asdict(best), "boundary_mode": mode, "boundary_threshold": threshold})
               for mode in ("disabled", "guidance", "separator") for threshold in (.55, .65, .75)]
-    best = max(zip(stage4, rows[-len(stage4):]), key=lambda item: (item[1]["mean_pq"], item[1]["mean_dice"]))[0]
+    best = max(zip(stage4, rows[-len(stage4):]), key=lambda item: (item[1]["pq_pooled"], item[1]["mean_dice"]))[0]
     stage5 = [evaluate("morphology", {**asdict(best), "morphology_kernel": kernel}) for kernel in (0, 1, 2, 3, 5)]
-    best = max(zip(stage5, rows[-len(stage5):]), key=lambda item: (item[1]["mean_pq"], item[1]["mean_dice"]))[0]
+    best = max(zip(stage5, rows[-len(stage5):]), key=lambda item: (item[1]["pq_pooled"], item[1]["mean_dice"]))[0]
     stage6 = [evaluate("solar_disk_mask", {**asdict(best), "use_solar_disk_mask": enabled})
               for enabled in (False, True)]
-    best = max(zip(stage6, rows[-len(stage6):]), key=lambda item: (item[1]["mean_pq"], item[1]["mean_dice"]))[0]
-    table = pd.DataFrame(rows).sort_values(["mean_pq", "mean_dice"], ascending=False).reset_index(drop=True)
+    best = max(zip(stage6, rows[-len(stage6):]), key=lambda item: (item[1]["pq_pooled"], item[1]["mean_dice"]))[0]
+    table = pd.DataFrame(rows).sort_values(["pq_pooled", "mean_dice", "mean_pq"], ascending=False).reset_index(drop=True)
     return best, table
 
 
