@@ -251,16 +251,37 @@ def build_instance_id_mask(index: CocoIndex, image_id: str) -> np.ndarray:
 
 
 def group_train_validation_split(index: CocoIndex, fraction: float, seed: int) -> tuple[list[str], list[str]]:
-    """Split COCO annotation entries by physical JPEG to prevent annotator leakage."""
+    """Split by UTC-like observation date, keeping each JPEG and every annotator view together.
+
+    Filaments can persist across neighboring observations. Grouping by date gives
+    a less optimistic validation estimate than merely separating annotation IDs
+    or filenames while still preserving every annotator-specific target.
+    """
     ids = np.array(sorted(index.images), dtype=object)
-    groups = np.array([get_physical_observation_key(index.images[image_id]) for image_id in ids], dtype=object)
-    train_idx, val_idx = next(GroupShuffleSplit(n_splits=1, test_size=fraction, random_state=seed).split(ids, groups=groups))
+    physical = np.array([
+        get_physical_observation_key(index.images[image_id]) for image_id in ids
+    ], dtype=object)
+    # MAGFiLO filenames begin with YYYYMMDDhhmmss; use date rather than image ID.
+    groups = np.array([
+        Path(get_physical_observation_key(index.images[image_id])).stem[:8]
+        for image_id in ids
+    ], dtype=object)
+    if len(set(groups)) < 2:
+        raise ValueError("At least two distinct observation dates are needed for a grouped split.")
+    train_idx, val_idx = next(
+        GroupShuffleSplit(n_splits=1, test_size=fraction, random_state=seed)
+        .split(ids, groups=groups)
+    )
     train_ids, val_ids = ids[train_idx].tolist(), ids[val_idx].tolist()
-    train_physical, val_physical = set(groups[train_idx]), set(groups[val_idx])
+    train_physical, val_physical = set(physical[train_idx]), set(physical[val_idx])
+    train_dates, val_dates = set(groups[train_idx]), set(groups[val_idx])
     assert train_physical.isdisjoint(val_physical), "Physical-observation leakage detected"
-    print(f"COCO annotation-image entries={len(ids)}, unique physical observations={len(set(groups))}, "
-          f"training annotation entries={len(train_ids)}, validation annotation entries={len(val_ids)}, "
-          f"training physical observations={len(train_physical)}, validation physical observations={len(val_physical)}, "
+    assert train_dates.isdisjoint(val_dates), "Observation-date leakage detected"
+    print(f"COCO annotation-image entries={len(ids)}, physical observations={len(set(physical))}, "
+          f"unique dates={len(set(groups))}, training annotation entries={len(train_ids)}, "
+          f"validation annotation entries={len(val_ids)}, training physical observations={len(train_physical)}, "
+          f"validation physical observations={len(val_physical)}, training dates={len(train_dates)}, "
+          f"validation dates={len(val_dates)}, "
           f"training filament instances={sum(len(index.annotations_by_image.get(i, [])) for i in train_ids)}, "
           f"validation filament instances={sum(len(index.annotations_by_image.get(i, [])) for i in val_ids)}")
     return train_ids, val_ids
