@@ -4,7 +4,7 @@ This repository contains a reproducible, model-generated instance-segmentation p
 
 ## Recommended Kaggle entry point
 
-Use **[`solar-filament-final-kaggle.ipynb`](solar-filament-final-kaggle.ipynb)**. It clones this branch at runtime, checks the installed PyTorch/CUDA environment, installs only missing non-Torch dependencies, verifies COCO polygons, trains the semantic/boundary model, tunes instance reconstruction on a tuning partition, reports metrics on a separate held-out partition, optionally retrains on all labelled views, and generates `/kaggle/working/submission.csv`.
+Use **[`solar-filament-final-kaggle.ipynb`](solar-filament-final-kaggle.ipynb)**. It clones this branch at runtime, checks the installed PyTorch/CUDA environment, installs only missing non-Torch dependencies, verifies COCO polygons, trains a ResNet-34 U-Net semantic/boundary model, and then trains a YOLO11-seg proposal model using the public no-cost pretrained starting weights. Detector-guided fusion is selected only when it improves pooled PQ on the tuning partition; an untouched set of held-out dates is reported separately. If selected, the detector is fine-tuned on all labelled annotation views, and the notebook generates `/kaggle/working/submission.csv` from actual test-image inference.
 
 ### Kaggle settings
 
@@ -21,6 +21,6 @@ Use **[`solar-filament-final-kaggle.ipynb`](solar-filament-final-kaggle.ipynb)**
 
 ## Reproducibility and limitations
 
-The notebook saves the Git commit, environment details, training history, checkpoint(s), selected post-processing parameters, held-out metrics, and submission. The local PQ implementation is a reproducible project evaluator; before claiming exact parity, compare it against the organizer's latest [self-evaluation notebook](https://www.kaggle.com/code/azimahmadzadeh/self-evaluation-notebook).
+The notebook saves the Git commit, environment details, training history, checkpoint(s), selected post-processing parameters, held-out metrics, and submission. The local pooled PQ implementation follows the published IoU > 0.5 matching rule and scores each annotator view separately. Still compare it with the organizer's latest [self-evaluation notebook](https://www.kaggle.com/code/azimahmadzadeh/self-evaluation-notebook) before claiming exact parity. The notebook has not been run end-to-end on a Kaggle GPU from this development environment; the first actual metrics and runtime must be recorded there.
 
 No leaderboard score is claimed by this repository without an actual Kaggle submission. Local held-out metrics and public leaderboard scores must be reported separately.
