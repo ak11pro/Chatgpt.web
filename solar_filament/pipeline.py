@@ -13,6 +13,8 @@ import random
 import time
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field
+from functools import lru_cache
+import hashlib
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
@@ -30,7 +32,6 @@ from torch import Tensor, nn
 from torch.nn import functional as F
 from torch.utils.data import Dataset
 from torch.utils.data import DataLoader
-from torchvision.models import ResNet34_Weights, resnet34
 
 LOGGER = logging.getLogger(__name__)
 
@@ -68,6 +69,8 @@ class PipelineConfig:
     tta_mode: str = "light"
     debug_mode: bool = False
     max_train_images: int | None = None
+    samples_per_epoch: int | None = 1600
+    mask_cache_dir: str = "/kaggle/working/solar_filament_mask_cache_v2"
     positive_probability: float = 0.50
     hard_negative_probability: float = 0.25
     random_probability: float = 0.25
@@ -306,100 +309,262 @@ def boundary_target(instance_ids: np.ndarray) -> np.ndarray:
 
 
 class SolarFilamentDataset(Dataset[dict[str, Any]]):
-    """High-resolution sampler; duplicate physical JPEGs retain independent annotator masks."""
+    """Crop sampler with full-image normalization and disk-cached instance masks.
 
-    def __init__(self, index: CocoIndex, image_dir: Path, image_ids: Sequence[str], config: PipelineConfig,
-                 training: bool) -> None:
-        self.index, self.image_dir, self.image_ids, self.config, self.training = index, image_dir, list(image_ids), config, training
+    COCO annotation entries stay independent. Repeated annotations for one JPEG
+    share the same physical pixels but never share their label maps.
+    """
+
+    def __init__(self, index: CocoIndex, image_dir: Path, image_ids: Sequence[str],
+                 config: PipelineConfig, training: bool) -> None:
+        self.index = index
+        self.image_dir = Path(image_dir)
+        self.image_ids = list(image_ids)
+        self.config = config
+        self.training = training
         total = config.positive_probability + config.hard_negative_probability + config.random_probability
         if training and not np.isclose(total, 1.0):
             raise ValueError("Crop sampling probabilities must sum to one")
         self._sampling_counts: dict[str, int] = defaultdict(int)
         self.positive_centers: dict[str, np.ndarray] = {}
         self.hard_negative_centers: dict[str, np.ndarray] = {}
+        self.mask_cache_dir = Path(config.mask_cache_dir)
+        self.mask_cache_dir.mkdir(parents=True, exist_ok=True)
         if training:
             self._build_crop_candidates()
 
     def __len__(self) -> int:
-        return len(self.image_ids) * (4 if self.training else 1)
+        if not self.training:
+            return len(self.image_ids)
+        if self.config.samples_per_epoch is not None:
+            return int(self.config.samples_per_epoch)
+        return max(1, len(self.image_ids) * 4)
+
+    @lru_cache(maxsize=4)
+    def _load_image(self, file_name: str) -> np.ndarray:
+        path = self.image_dir / file_name
+        with Image.open(path) as handle:
+            image = np.asarray(handle.convert("L"))
+        if image.shape != (self.config.image_size, self.config.image_size):
+            raise ValueError(f"Unexpected image size for {path}: {image.shape}")
+        return image
+
+    def _mask_cache_path(self, image_id: str) -> Path:
+        meta = self.index.images[image_id]
+        records = self.index.annotations_by_image.get(image_id, [])
+        # Include annotation IDs and file identity so changed label sets don't
+        # silently reuse a stale mask. Cache version is also encoded in dirname.
+        token = "|".join([
+            image_id,
+            Path(str(meta["file_name"])).name,
+            *[record.annotation_id for record in records],
+        ])
+        digest = hashlib.sha1(token.encode("utf-8")).hexdigest()
+        return self.mask_cache_dir / f"{digest}.npz"
+
+    @lru_cache(maxsize=4)
+    def _load_instance_ids(self, image_id: str) -> np.ndarray:
+        path = self._mask_cache_path(image_id)
+        if path.exists():
+            with np.load(path, allow_pickle=False) as stored:
+                return stored["instance_ids"].astype(np.int32, copy=False)
+
+        labels = build_instance_id_mask(self.index, image_id)
+        # Filament count per image is far below uint16 limits. Compressing the
+        # sparse label map dramatically reduces the on-disk cache footprint.
+        temporary = path.with_suffix(".tmp.npz")
+        np.savez_compressed(temporary, instance_ids=labels.astype(np.uint16))
+        temporary.replace(path)
+        return labels
+
+    @lru_cache(maxsize=4)
+    def _load_boundary(self, image_id: str) -> np.ndarray:
+        return boundary_target(self._load_instance_ids(image_id)).astype(np.uint8)
 
     def _build_crop_candidates(self) -> None:
-        """Create train-only positive and high-texture empty locations once."""
+        """Build positive and hard-negative crop centers once per annotation view."""
         for image_id in self.image_ids:
             meta = self.index.images[image_id]
-            image = np.asarray(Image.open(self.image_dir / meta["file_name"]).convert("L"))
-            labels = build_instance_id_mask(self.index, image_id)
+            image = self._load_image(str(meta["file_name"]))
+            labels = self._load_instance_ids(image_id)
             positive = np.argwhere(labels > 0)
-            self.positive_centers[image_id] = positive[::max(1, len(positive) // 2048)]
-            gradient = np.abs(cv2.Laplacian(robust_normalize(image), cv2.CV_32F))
-            stride, half = max(32, self.config.train_tile_size // 4), self.config.train_tile_size // 2
+            if len(positive) > 4096:
+                positive = positive[::max(1, len(positive) // 4096)]
+            self.positive_centers[image_id] = positive.astype(np.int32, copy=False)
+
+            normalized = robust_normalize(image)
+            gradient = np.abs(cv2.Laplacian(normalized, cv2.CV_32F))
+            stride = max(32, self.config.train_tile_size // 4)
+            half = self.config.train_tile_size // 2
             candidates: list[tuple[int, int]] = []
             for y in range(half, max(half + 1, image.shape[0] - half), stride):
                 for x in range(half, max(half + 1, image.shape[1] - half), stride):
-                    crop = labels[max(0, y-half):min(labels.shape[0], y+half), max(0, x-half):min(labels.shape[1], x+half)]
-                    if not crop.any() and gradient[y, x] >= np.percentile(gradient, 75):
+                    crop = labels[y-half:y+half, x-half:x+half]
+                    if crop.size and not crop.any() and gradient[y, x] >= np.percentile(gradient, 75):
                         candidates.append((y, x))
-            self.hard_negative_centers[image_id] = np.asarray(candidates, dtype=np.int32).reshape(-1, 2)
+            self.hard_negative_centers[image_id] = np.asarray(
+                candidates, dtype=np.int32
+            ).reshape(-1, 2)
 
     def sampling_distribution(self) -> dict[str, float]:
         total = sum(self._sampling_counts.values())
         return {name: count / total for name, count in self._sampling_counts.items()} if total else {}
 
-    def __getitem__(self, item: int) -> dict[str, Tensor]:
-        image_id = self.image_ids[item % len(self.image_ids)]
+    def __getitem__(self, item: int) -> dict[str, Any]:
+        if not self.image_ids:
+            raise IndexError("Dataset has no image IDs")
+        image_id = (
+            self.image_ids[random.randrange(len(self.image_ids))]
+            if self.training else self.image_ids[item]
+        )
         meta = self.index.images[image_id]
-        image = np.asarray(Image.open(self.image_dir / meta["file_name"]).convert("L"))
-        instance_ids = build_instance_id_mask(self.index, image_id)
-        if self.training:
-            image, instance_ids = self._sample_crop(image, instance_ids, image_id)
-            if random.random() < .5:
-                image, instance_ids = np.fliplr(image).copy(), np.fliplr(instance_ids).copy()
-            if random.random() < .5:
-                image, instance_ids = np.flipud(image).copy(), np.flipud(instance_ids).copy()
-            k = random.randrange(4)
-            image, instance_ids = np.rot90(image, k).copy(), np.rot90(instance_ids, k).copy()
-        semantic = (instance_ids > 0).astype(np.float32)
-        return {"image": torch.from_numpy(robust_normalize(image)[None]),
-                "semantic": torch.from_numpy(semantic[None]),
-                "boundary": torch.from_numpy(boundary_target(instance_ids)[None].astype(np.float32)),
-                "instance_ids": torch.from_numpy(instance_ids), "image_id": image_id,
-                "sample_index": torch.tensor(item, dtype=torch.int64)}
+        # Normalize the *whole observation* before cropping. This exactly
+        # matches full-image tiled inference and prevents crop-dependent scaling.
+        image = robust_normalize(self._load_image(str(meta["file_name"])))
+        instance_ids = self._load_instance_ids(image_id)
+        boundary = self._load_boundary(image_id)
 
-    def _sample_crop(self, image: np.ndarray, labels: np.ndarray, image_id: str) -> tuple[np.ndarray, np.ndarray]:
+        if self.training:
+            image, instance_ids, boundary = self._sample_crop(
+                image, instance_ids, boundary, image_id
+            )
+            if random.random() < 0.5:
+                image = np.fliplr(image).copy()
+                instance_ids = np.fliplr(instance_ids).copy()
+                boundary = np.fliplr(boundary).copy()
+            if random.random() < 0.5:
+                image = np.flipud(image).copy()
+                instance_ids = np.flipud(instance_ids).copy()
+                boundary = np.flipud(boundary).copy()
+            k = random.randrange(4)
+            image = np.rot90(image, k).copy()
+            instance_ids = np.rot90(instance_ids, k).copy()
+            boundary = np.rot90(boundary, k).copy()
+
+        image_tensor = torch.from_numpy(np.ascontiguousarray(image[None].astype(np.float32)))
+        semantic = (instance_ids > 0).astype(np.float32)
+        return {
+            "image": image_tensor,
+            "semantic": torch.from_numpy(np.ascontiguousarray(semantic[None])),
+            "boundary": torch.from_numpy(np.ascontiguousarray(boundary[None].astype(np.float32))),
+            "instance_ids": torch.from_numpy(np.ascontiguousarray(instance_ids.astype(np.int32))),
+            # Keep opaque IDs as strings; default DataLoader collation can handle
+            # strings when stored as metadata, but training moves only Tensors.
+            "image_id": image_id,
+            "sample_index": torch.tensor(item, dtype=torch.int64),
+        }
+
+    def _sample_crop(self, image: np.ndarray, labels: np.ndarray, boundary: np.ndarray,
+                     image_id: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         size = self.config.train_tile_size
-        pad_h, pad_w = max(0, size - image.shape[0]), max(0, size - image.shape[1])
-        image, labels = np.pad(image, ((0, pad_h), (0, pad_w))), np.pad(labels, ((0, pad_h), (0, pad_w)))
+        pad_h = max(0, size - image.shape[0])
+        pad_w = max(0, size - image.shape[1])
+        padding = ((0, pad_h), (0, pad_w))
+        if pad_h or pad_w:
+            image = np.pad(image, padding, constant_values=0)
+            labels = np.pad(labels, padding, constant_values=0)
+            boundary = np.pad(boundary, padding, constant_values=0)
+
         draw = random.random()
         positive = self.positive_centers.get(image_id, np.argwhere(labels > 0))
-        hard_negative = self.hard_negative_centers.get(image_id, np.empty((0, 2), dtype=np.int32))
+        hard_negative = self.hard_negative_centers.get(
+            image_id, np.empty((0, 2), dtype=np.int32)
+        )
+
         if len(positive) and draw < self.config.positive_probability:
             self._sampling_counts["positive"] += 1
             y, x = positive[random.randrange(len(positive))]
-            top, left = y - random.randrange(size), x - random.randrange(size)
-        elif len(hard_negative) and draw < self.config.positive_probability + self.config.hard_negative_probability:
+            top, left = int(y) - random.randrange(size), int(x) - random.randrange(size)
+        elif len(hard_negative) and draw < (
+            self.config.positive_probability + self.config.hard_negative_probability
+        ):
             self._sampling_counts["hard_negative"] += 1
             y, x = hard_negative[random.randrange(len(hard_negative))]
-            top, left = y - size // 2, x - size // 2
+            top, left = int(y) - size // 2, int(x) - size // 2
         else:
             self._sampling_counts["random"] += 1
-            top, left = random.randrange(image.shape[0] - size + 1), random.randrange(image.shape[1] - size + 1)
-        top, left = np.clip(top, 0, image.shape[0] - size), np.clip(left, 0, image.shape[1] - size)
-        return image[top:top + size, left:left + size], labels[top:top + size, left:left + size]
+            top = random.randrange(image.shape[0] - size + 1)
+            left = random.randrange(image.shape[1] - size + 1)
+
+        top = int(np.clip(top, 0, image.shape[0] - size))
+        left = int(np.clip(left, 0, image.shape[1] - size))
+        crop = np.s_[top:top + size, left:left + size]
+        return image[crop].copy(), labels[crop].copy(), boundary[crop].copy()
+
+
+
+class _BasicResidualBlock(nn.Module):
+    """Small torchvision-independent ResNet basic block used only as a fallback."""
+
+    expansion = 1
+
+    def __init__(self, in_channels: int, out_channels: int, stride: int = 1) -> None:
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, 3, stride=stride, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, 3, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+        self.downsample = (
+            nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, 1, stride=stride, bias=False),
+                nn.BatchNorm2d(out_channels),
+            )
+            if stride != 1 or in_channels != out_channels else nn.Identity()
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        identity = self.downsample(x)
+        out = self.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        return self.relu(out + identity)
+
+
+class _FallbackResNet34(nn.Module):
+    """ResNet-34 shape-compatible fallback; no pretrained weights are claimed."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.conv1 = nn.Conv2d(3, 64, 7, stride=2, padding=3, bias=False)
+        self.bn1 = nn.BatchNorm2d(64)
+        self.relu = nn.ReLU(inplace=True)
+        self.maxpool = nn.MaxPool2d(3, stride=2, padding=1)
+        self._in_channels = 64
+        self.layer1 = self._make_layer(64, 3, 1)
+        self.layer2 = self._make_layer(128, 4, 2)
+        self.layer3 = self._make_layer(256, 6, 2)
+        self.layer4 = self._make_layer(512, 3, 2)
+
+    def _make_layer(self, channels: int, count: int, stride: int) -> nn.Sequential:
+        blocks = [_BasicResidualBlock(self._in_channels, channels, stride)]
+        self._in_channels = channels
+        blocks.extend(_BasicResidualBlock(channels, channels) for _ in range(count - 1))
+        return nn.Sequential(*blocks)
 
 
 def build_encoder(pretrained: bool = True) -> tuple[nn.Module, bool]:
-    """Load cached ImageNet weights when available, with an explicit offline fallback."""
+    """Use cached ImageNet ResNet-34 weights when possible.
+
+    Torchvision is imported lazily: if the Kaggle image has a binary
+    torch/torchvision mismatch, the rest of this module remains importable and
+    a shape-compatible pure-PyTorch encoder is used with an explicit warning.
+    """
     if not pretrained:
         print("Pretrained encoder loaded: NO (disabled by configuration)")
-        return resnet34(weights=None), False
+        return _FallbackResNet34(), False
     try:
+        from torchvision.models import ResNet34_Weights, resnet34
         encoder = resnet34(weights=ResNet34_Weights.IMAGENET1K_V1)
         print("Pretrained encoder loaded: YES")
         return encoder, True
     except Exception as error:
-        LOGGER.warning("Could not load pretrained ResNet-34 weights; using random initialization: %s", error)
-        print("Pretrained encoder loaded: NO (weights unavailable)")
-        return resnet34(weights=None), False
+        LOGGER.warning(
+            "Could not load torchvision/ImageNet ResNet-34 weights; using a local "
+            "randomly initialized ResNet-34 fallback. Torch remains installed as provided. Error: %s",
+            error,
+        )
+        print("Pretrained encoder loaded: NO (torchvision unavailable; random fallback)")
+        return _FallbackResNet34(), False
 
 
 class FilamentSegmentationModel(nn.Module):
