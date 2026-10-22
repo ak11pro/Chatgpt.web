@@ -741,7 +741,14 @@ def reconstruct_instances(probability: np.ndarray, config: PipelineConfig, bound
         if boundary_probability is not None and config.boundary_mode == "guidance":
             distance = distance * (1.0 - 0.5 * boundary_probability)
         watershed_mask = binary & ~separator if separator is not None else binary
-        peaks = peak_local_max(distance, min_distance=config.watershed_peak_distance, labels=binary)
+        # Seeds must lie inside the actual watershed domain. In separator mode,
+        # finding peaks against the uncut binary mask can place seeds on removed
+        # boundary pixels and produce unstable marker assignments.
+        peaks = peak_local_max(
+            distance,
+            min_distance=config.watershed_peak_distance,
+            labels=watershed_mask,
+        )
         markers = np.zeros(binary.shape, dtype=np.int32)
         for label, (y, x) in enumerate(peaks, 1): markers[y, x] = label
         markers, _ = ndi.label(markers)
