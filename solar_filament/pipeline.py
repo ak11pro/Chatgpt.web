@@ -67,6 +67,7 @@ class PipelineConfig:
     boundary_head: bool = True
     use_tta: bool = False
     tta_mode: str = "light"
+    use_solar_disk_mask: bool = True
     debug_mode: bool = False
     max_train_images: int | None = None
     samples_per_epoch: int | None = 1600
@@ -397,10 +398,11 @@ class SolarFilamentDataset(Dataset[dict[str, Any]]):
             stride = max(32, self.config.train_tile_size // 4)
             half = self.config.train_tile_size // 2
             candidates: list[tuple[int, int]] = []
+            gradient_threshold = float(np.percentile(gradient, 75))
             for y in range(half, max(half + 1, image.shape[0] - half), stride):
                 for x in range(half, max(half + 1, image.shape[1] - half), stride):
                     crop = labels[y-half:y+half, x-half:x+half]
-                    if crop.size and not crop.any() and gradient[y, x] >= np.percentile(gradient, 75):
+                    if crop.size and not crop.any() and gradient[y, x] >= gradient_threshold:
                         candidates.append((y, x))
             self.hard_negative_centers[image_id] = np.asarray(
                 candidates, dtype=np.int32
@@ -704,7 +706,8 @@ def relabel_sequential(labels: np.ndarray) -> np.ndarray:
 def reconstruct_instances(probability: np.ndarray, config: PipelineConfig, boundary_probability: np.ndarray | None = None,
                           disk_mask: np.ndarray | None = None) -> np.ndarray:
     binary = probability >= config.threshold
-    if disk_mask is not None: binary &= disk_mask
+    if disk_mask is not None and config.use_solar_disk_mask:
+        binary &= disk_mask
     # Boundary prediction guides marker placement or optional separator bands; it never erases all boundary pixels.
     separator = None
     if boundary_probability is not None and config.boundary_mode == "separator":
@@ -912,12 +915,12 @@ def cache_validation_predictions(model: nn.Module, dataset: SolarFilamentDataset
         truth = build_instance_id_mask(dataset.index, image_id)
         disk = detect_solar_disk(image)
         payload: dict[str, np.ndarray] = {
-            "semantic": semantic.astype(np.float16),
+            "semantic": semantic.astype(np.float32),
             "truth": truth.astype(np.int32),
             "disk": disk.astype(np.uint8),
         }
         if boundary is not None:
-            payload["boundary"] = boundary.astype(np.float16)
+            payload["boundary"] = boundary.astype(np.float32)
         np.savez_compressed(path, **payload)
         cached.append((semantic, boundary, truth, disk))
     return cached
@@ -943,13 +946,19 @@ def optimize_postprocessing(probabilities: Iterable[np.ndarray], boundaries: Ite
     best = max(zip(stage1, rows), key=lambda item: (item[1]["mean_pq"], item[1]["mean_dice"]))[0]
     stage2 = [evaluate("min_area", {**asdict(best), "min_component_area": area}) for area in (10, 20, 50, 100, 200, 500)]
     best = max(zip(stage2, rows[-len(stage2):]), key=lambda item: (item[1]["mean_pq"], item[1]["mean_dice"]))[0]
-    stage3 = [evaluate("peak_distance", {**asdict(best), "watershed_peak_distance": distance}) for distance in (8, 12, 16, 20, 24, 32)] if best.watershed else [best]
-    best = max(zip(stage3, rows[-len(stage3):]), key=lambda item: (item[1]["mean_pq"], item[1]["mean_dice"]))[0]
+    if best.watershed:
+        stage3 = [evaluate("peak_distance", {**asdict(best), "watershed_peak_distance": distance})
+                  for distance in (8, 12, 16, 20, 24, 32)]
+        best = max(zip(stage3, rows[-len(stage3):]),
+                   key=lambda item: (item[1]["mean_pq"], item[1]["mean_dice"]))[0]
     stage4 = [evaluate("boundary", {**asdict(best), "boundary_mode": mode, "boundary_threshold": threshold})
               for mode in ("disabled", "guidance", "separator") for threshold in (.55, .65, .75)]
     best = max(zip(stage4, rows[-len(stage4):]), key=lambda item: (item[1]["mean_pq"], item[1]["mean_dice"]))[0]
     stage5 = [evaluate("morphology", {**asdict(best), "morphology_kernel": kernel}) for kernel in (0, 1, 2, 3, 5)]
     best = max(zip(stage5, rows[-len(stage5):]), key=lambda item: (item[1]["mean_pq"], item[1]["mean_dice"]))[0]
+    stage6 = [evaluate("solar_disk_mask", {**asdict(best), "use_solar_disk_mask": enabled})
+              for enabled in (False, True)]
+    best = max(zip(stage6, rows[-len(stage6):]), key=lambda item: (item[1]["mean_pq"], item[1]["mean_dice"]))[0]
     table = pd.DataFrame(rows).sort_values(["mean_pq", "mean_dice"], ascending=False).reset_index(drop=True)
     return best, table
 
