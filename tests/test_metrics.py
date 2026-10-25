@@ -111,3 +111,13 @@ def test_physical_observation_group_split(tmp_path) -> None:
     assert train_ids and val_ids
     assert train_files.isdisjoint(val_files)
     assert train_dates.isdisjoint(val_dates)
+
+
+def test_positive_instance_labels_when_no_background() -> None:
+    from solar_filament.pipeline import positive_instance_labels
+
+    single = np.ones((4, 4), dtype=np.int32)
+    assert positive_instance_labels(single).tolist() == [1]
+
+    multi = np.array([[1, 1], [2, 0]], dtype=np.int32)
+    assert positive_instance_labels(multi).tolist() == [1, 2]
