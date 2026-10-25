@@ -301,10 +301,12 @@ def measure_foreground_prevalence(index: CocoIndex, image_ids: Sequence[str]) ->
 
 
 def robust_normalize(image: np.ndarray) -> np.ndarray:
-    image = image.astype(np.float32)
+    """Normalize grayscale image data and guarantee OpenCV-compatible float32 output."""
+    image = np.asarray(image, dtype=np.float32)
     low, high = np.percentile(image, (1, 99))
-    return np.clip((image - low) / max(high - low, 1e-6), 0, 1)
-
+    scale = np.float32(max(float(high) - float(low), 1e-6))
+    normalized = (image - np.float32(low)) / scale
+    return np.clip(normalized, 0.0, 1.0).astype(np.float32, copy=False)
 
 def detect_solar_disk(image: np.ndarray) -> np.ndarray:
     """Conservative disk estimate; fails open rather than removing solar pixels."""
