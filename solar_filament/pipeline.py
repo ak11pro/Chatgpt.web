@@ -658,8 +658,10 @@ def compute_instance_iou_matrix(pred_ids: np.ndarray, truth_ids: np.ndarray) -> 
     """Vectorized pair histogram; scans the image once rather than per object pair."""
     if pred_ids.shape != truth_ids.shape:
         raise ValueError("Prediction and ground-truth label maps must have identical shapes")
-    gt_labels, gt_inverse = np.unique(truth_ids, return_inverse=True)
-    pred_labels, pred_inverse = np.unique(pred_ids, return_inverse=True)
+    # Flatten explicitly: NumPy 2.x may preserve the input shape in return_inverse,
+    # but np.bincount requires a one-dimensional index array.
+    gt_labels, gt_inverse = np.unique(np.asarray(truth_ids).ravel(), return_inverse=True)
+    pred_labels, pred_inverse = np.unique(np.asarray(pred_ids).ravel(), return_inverse=True)
     # Labels are compacted locally, so arbitrary COCO/source labels are safe.
     overlap = np.bincount(
         gt_inverse * len(pred_labels) + pred_inverse,
