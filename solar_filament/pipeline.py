@@ -715,6 +715,12 @@ def compute_pq(pred_ids: np.ndarray, truth_ids: np.ndarray, threshold: float = .
             "one_to_many": one_to_many, "many_to_one": many_to_one}
 
 
+def positive_instance_labels(labels: np.ndarray) -> np.ndarray:
+    """Return all positive instance IDs, even if label 0 is absent."""
+    values = np.unique(labels)
+    return values[values > 0]
+
+
 def relabel_sequential(labels: np.ndarray) -> np.ndarray:
     """Compact surviving instance IDs while preserving watershed separations."""
     result = np.zeros_like(labels, dtype=np.int32)
@@ -755,7 +761,7 @@ def reconstruct_instances(probability: np.ndarray, config: PipelineConfig, bound
         labels = watershed(-distance, markers, mask=watershed_mask) if markers.max() else ndi.label(binary)[0]
     else:
         labels, _ = ndi.label(binary)
-    for label in np.unique(labels[labels > 0]):
+    for label in positive_instance_labels(labels):
         if (labels == label).sum() < config.min_component_area: labels[labels == label] = 0
     return relabel_sequential(labels)
 
@@ -825,7 +831,7 @@ def create_submission(model: nn.Module, data: CompetitionData, config: PipelineC
         image = np.asarray(Image.open(path).convert("L")); probability, boundary = predict_tiled(model, image, config, device)
         labels = reconstruct_instances(probability, config, boundary, detect_solar_disk(image))
         count = 0
-        for label in np.unique(labels[labels > 0]):
+        for label in positive_instance_labels(labels):
             mask = labels == label
             assert mask.shape == image.shape, "Predicted mask dimensions changed during inference"
             validate_rle(mask)
