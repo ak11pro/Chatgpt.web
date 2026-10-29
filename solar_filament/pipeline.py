@@ -33,6 +33,8 @@ from torch.nn import functional as F
 from torch.utils.data import Dataset
 from torch.utils.data import DataLoader
 
+from .disk import Disk, detect_disk, flatten
+
 LOGGER = logging.getLogger(__name__)
 
 
@@ -46,7 +48,7 @@ class PipelineConfig:
     tile_overlap: float = 0.35
     inference_batch_size: int = 4
     weighted_tile_blending: bool = True
-    in_channels: int = 1
+    in_channels: int = 2
     encoder: str = "resnet34"
     pretrained_encoder: bool = True
     epochs: int = 50
@@ -308,19 +310,21 @@ def robust_normalize(image: np.ndarray) -> np.ndarray:
     normalized = (image - np.float32(low)) / scale
     return np.clip(normalized, 0.0, 1.0).astype(np.float32, copy=False)
 
+def preprocess_flattened_uint8(image: np.ndarray) -> tuple[np.ndarray, Disk]:
+    """Return cached-style limb-corrected pixels and their fitted solar geometry."""
+    image = np.asarray(image)
+    if image.ndim != 2:
+        raise ValueError(f"Expected a single-channel H-alpha image, got shape {image.shape}")
+    disk = detect_disk(image)
+    flat = flatten(image, disk)
+    packed = np.clip(flat, 0.0, 2.0) * (255.0 / 2.0)
+    return np.rint(packed).astype(np.uint8), disk
+
+
 def detect_solar_disk(image: np.ndarray) -> np.ndarray:
-    """Conservative disk estimate; fails open rather than removing solar pixels."""
-    gray = (robust_normalize(image) * 255).astype(np.uint8)
-    blurred = cv2.GaussianBlur(gray, (0, 0), 11)
-    circles = cv2.HoughCircles(blurred, cv2.HOUGH_GRADIENT, 1.2, gray.shape[0] // 2,
-                               param1=80, param2=30, minRadius=int(min(gray.shape) * .30),
-                               maxRadius=int(min(gray.shape) * .55))
-    if circles is None:
-        return np.ones(gray.shape, dtype=bool)
-    x, y, radius = np.rint(circles[0, 0]).astype(int)
-    disk = np.zeros(gray.shape, dtype=np.uint8)
-    cv2.circle(disk, (x, y), radius, 1, thickness=-1)
-    return disk.astype(bool)
+    """Mask the fitted solar disk, trimming the noisy outer limb conservatively."""
+    disk = detect_disk(np.asarray(image))
+    return disk.mask(image.shape, shrink=0.985)
 
 
 def boundary_target(instance_ids: np.ndarray) -> np.ndarray:
@@ -354,6 +358,10 @@ class SolarFilamentDataset(Dataset[dict[str, Any]]):
         self.hard_negative_centers: dict[str, np.ndarray] = {}
         self.mask_cache_dir = Path(config.mask_cache_dir)
         self.mask_cache_dir.mkdir(parents=True, exist_ok=True)
+        self.preprocessed_dir = self.mask_cache_dir / "preprocessed_limb_v1"
+        self.preprocessed_dir.mkdir(parents=True, exist_ok=True)
+        if config.in_channels not in (1, 2):
+            raise ValueError("in_channels must be 1 or 2")
         if training:
             self._build_crop_candidates()
 
@@ -372,6 +380,42 @@ class SolarFilamentDataset(Dataset[dict[str, Any]]):
         if image.shape != (self.config.image_size, self.config.image_size):
             raise ValueError(f"Unexpected image size for {path}: {image.shape}")
         return image
+
+    @lru_cache(maxsize=16)
+    def _load_preprocessed(self, image_id: str) -> tuple[np.ndarray, Disk]:
+        """Load or create limb-darkening-flattened pixels and solar disk geometry.
+
+        Cache by physical filename rather than annotation ID, because multiple
+        annotators label the same JPEG. The cache stores only image-derived
+        information; it never stores or reads test ground-truth labels.
+        """
+        meta = self.index.images[image_id]
+        stem = Path(str(meta["file_name"])).stem
+        flat_path = self.preprocessed_dir / f"{stem}.png"
+        geometry_path = self.preprocessed_dir / f"{stem}.json"
+
+        if flat_path.is_file() and geometry_path.is_file():
+            flat_u8 = cv2.imread(str(flat_path), cv2.IMREAD_GRAYSCALE)
+            try:
+                geometry = json.loads(geometry_path.read_text(encoding="utf-8"))
+                if flat_u8 is not None and flat_u8.shape == (self.config.image_size, self.config.image_size):
+                    return flat_u8, Disk(
+                        cx=float(geometry["cx"]),
+                        cy=float(geometry["cy"]),
+                        radius=float(geometry["radius"]),
+                    )
+            except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+                pass
+
+        raw = self._load_image(str(meta["file_name"]))
+        flat_u8, disk = preprocess_flattened_uint8(raw)
+        if not cv2.imwrite(str(flat_path), flat_u8):
+            raise OSError(f"Could not write preprocessed image cache: {flat_path}")
+        geometry_path.write_text(
+            json.dumps({"cx": disk.cx, "cy": disk.cy, "radius": disk.radius}),
+            encoding="utf-8",
+        )
+        return flat_u8, disk
 
     def _mask_cache_path(self, image_id: str) -> Path:
         meta = self.index.images[image_id]
@@ -407,23 +451,30 @@ class SolarFilamentDataset(Dataset[dict[str, Any]]):
 
     def _build_crop_candidates(self) -> None:
         """Build positive and hard-negative crop centers once per annotation view."""
+        gradient_by_stem: dict[str, np.ndarray] = {}
         for image_id in self.image_ids:
             meta = self.index.images[image_id]
-            image = self._load_image(str(meta["file_name"]))
+            stem = Path(str(meta["file_name"])).stem
+            flat_u8, _ = self._load_preprocessed(image_id)
             labels = self._load_instance_ids(image_id)
             positive = np.argwhere(labels > 0)
             if len(positive) > 4096:
                 positive = positive[::max(1, len(positive) // 4096)]
             self.positive_centers[image_id] = positive.astype(np.int32, copy=False)
 
-            normalized = robust_normalize(image)
-            gradient = np.abs(cv2.Laplacian(normalized, cv2.CV_32F))
+            # Use flattened intensity for the hard-negative texture map. Explicit
+            # float32 input avoids OpenCV CV_32F depth/channel assertion failures.
+            gradient = gradient_by_stem.get(stem)
+            if gradient is None:
+                normalized = np.ascontiguousarray(flat_u8.astype(np.float32) / 255.0)
+                gradient = np.abs(cv2.Laplacian(normalized, cv2.CV_32F))
+                gradient_by_stem[stem] = gradient
             stride = max(32, self.config.train_tile_size // 4)
             half = self.config.train_tile_size // 2
             candidates: list[tuple[int, int]] = []
             gradient_threshold = float(np.percentile(gradient, 75))
-            for y in range(half, max(half + 1, image.shape[0] - half), stride):
-                for x in range(half, max(half + 1, image.shape[1] - half), stride):
+            for y in range(half, max(half + 1, flat_u8.shape[0] - half), stride):
+                for x in range(half, max(half + 1, flat_u8.shape[1] - half), stride):
                     crop = labels[y-half:y+half, x-half:x+half]
                     if crop.size and not crop.any() and gradient[y, x] >= gradient_threshold:
                         candidates.append((y, x))
@@ -442,45 +493,59 @@ class SolarFilamentDataset(Dataset[dict[str, Any]]):
             self.image_ids[random.randrange(len(self.image_ids))]
             if self.training else self.image_ids[item]
         )
-        meta = self.index.images[image_id]
-        # Normalize the *whole observation* before cropping. This exactly
-        # matches full-image tiled inference and prevents crop-dependent scaling.
-        image = robust_normalize(self._load_image(str(meta["file_name"])))
+        flat_u8, disk = self._load_preprocessed(image_id)
+        # Channel 0 is limb-darkening-corrected intensity; channel 1 carries
+        # normalized distance from the fitted solar limb.
+        image = np.ascontiguousarray(flat_u8.astype(np.float32) / 255.0)
+        radial = np.ascontiguousarray(disk.radius_map(image.shape).astype(np.float32))
         instance_ids = self._load_instance_ids(image_id)
         boundary = self._load_boundary(image_id)
 
         if self.training:
-            image, instance_ids, boundary = self._sample_crop(
-                image, instance_ids, boundary, image_id
+            image, instance_ids, boundary, radial = self._sample_crop(
+                image, instance_ids, boundary, radial, image_id
             )
             if random.random() < 0.5:
                 image = np.fliplr(image).copy()
                 instance_ids = np.fliplr(instance_ids).copy()
                 boundary = np.fliplr(boundary).copy()
+                radial = np.fliplr(radial).copy()
             if random.random() < 0.5:
                 image = np.flipud(image).copy()
                 instance_ids = np.flipud(instance_ids).copy()
                 boundary = np.flipud(boundary).copy()
+                radial = np.flipud(radial).copy()
             k = random.randrange(4)
             image = np.rot90(image, k).copy()
             instance_ids = np.rot90(instance_ids, k).copy()
             boundary = np.rot90(boundary, k).copy()
+            radial = np.rot90(radial, k).copy()
+            # Mild intensity-only jitter helps across observing sites. The
+            # radial coordinate and labels remain geometrically exact.
+            if random.random() < 0.5:
+                gain = random.uniform(0.90, 1.10)
+                offset = random.uniform(-0.04, 0.04)
+                image = np.clip(image * gain + offset, 0.0, 1.0).astype(np.float32)
 
-        image_tensor = torch.from_numpy(np.ascontiguousarray(image[None].astype(np.float32)))
+        channels = (
+            np.stack([image, radial], axis=0)
+            if self.config.in_channels == 2 else image[None]
+        )
+        image_tensor = torch.from_numpy(np.ascontiguousarray(channels.astype(np.float32)))
         semantic = (instance_ids > 0).astype(np.float32)
         return {
             "image": image_tensor,
             "semantic": torch.from_numpy(np.ascontiguousarray(semantic[None])),
             "boundary": torch.from_numpy(np.ascontiguousarray(boundary[None].astype(np.float32))),
             "instance_ids": torch.from_numpy(np.ascontiguousarray(instance_ids.astype(np.int32))),
-            # Keep opaque IDs as strings; default DataLoader collation can handle
-            # strings when stored as metadata, but training moves only Tensors.
             "image_id": image_id,
             "sample_index": torch.tensor(item, dtype=torch.int64),
         }
 
-    def _sample_crop(self, image: np.ndarray, labels: np.ndarray, boundary: np.ndarray,
-                     image_id: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def _sample_crop(
+        self, image: np.ndarray, labels: np.ndarray, boundary: np.ndarray,
+        radial: np.ndarray, image_id: str
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         size = self.config.train_tile_size
         pad_h = max(0, size - image.shape[0])
         pad_w = max(0, size - image.shape[1])
@@ -489,6 +554,7 @@ class SolarFilamentDataset(Dataset[dict[str, Any]]):
             image = np.pad(image, padding, constant_values=0)
             labels = np.pad(labels, padding, constant_values=0)
             boundary = np.pad(boundary, padding, constant_values=0)
+            radial = np.pad(radial, padding, constant_values=2.0)
 
         draw = random.random()
         positive = self.positive_centers.get(image_id, np.argwhere(labels > 0))
@@ -514,7 +580,12 @@ class SolarFilamentDataset(Dataset[dict[str, Any]]):
         top = int(np.clip(top, 0, image.shape[0] - size))
         left = int(np.clip(left, 0, image.shape[1] - size))
         crop = np.s_[top:top + size, left:left + size]
-        return image[crop].copy(), labels[crop].copy(), boundary[crop].copy()
+        return (
+            image[crop].copy(),
+            labels[crop].copy(),
+            boundary[crop].copy(),
+            radial[crop].copy(),
+        )
 
 
 
@@ -602,7 +673,12 @@ class FilamentSegmentationModel(nn.Module):
             old = encoder.conv1
             encoder.conv1 = nn.Conv2d(config.in_channels, 64, 7, 2, 3, bias=False)
             with torch.no_grad():
-                encoder.conv1.weight.copy_(old.weight.mean(1, keepdim=True))
+                # Preserve the RGB-pretrained filters for intensity. Start the
+                # geometry/radius channel at zero so it cannot swamp that signal.
+                mean_weight = old.weight.mean(1, keepdim=True)
+                encoder.conv1.weight[:, :1].copy_(mean_weight)
+                if config.in_channels > 1:
+                    encoder.conv1.weight[:, 1:].zero_()
         self.stem = nn.Sequential(encoder.conv1, encoder.bn1, encoder.relu)
         self.pool, self.layer1, self.layer2 = encoder.maxpool, encoder.layer1, encoder.layer2
         self.layer3, self.layer4 = encoder.layer3, encoder.layer4
@@ -776,25 +852,61 @@ def tile_starts(length: int, tile: int, overlap: float) -> list[int]:
 
 
 @torch.inference_mode()
-def predict_tiled(model: nn.Module, image: np.ndarray, config: PipelineConfig, device: torch.device) -> tuple[np.ndarray, np.ndarray | None]:
-    """Batched, overlap-blended full-resolution inference with optional light TTA."""
-    image = robust_normalize(image); h, w = image.shape; tile = config.train_tile_size
-    sums, counts, boundary_sums = np.zeros((h, w), np.float32), np.zeros((h, w), np.float32), np.zeros((h, w), np.float32)
+def predict_tiled(
+    model: nn.Module, image: np.ndarray, config: PipelineConfig, device: torch.device
+) -> tuple[np.ndarray, np.ndarray | None]:
+    """Limb-corrected, radial-aware tiled inference with optional dihedral TTA."""
+    image = np.asarray(image)
+    h, w = image.shape
+    tile = config.train_tile_size
+    flat_u8, disk = preprocess_flattened_uint8(image)
+    intensity = flat_u8.astype(np.float32) / 255.0
+    if config.in_channels == 2:
+        image_channels = np.stack(
+            [intensity, disk.radius_map(image.shape).astype(np.float32)], axis=0
+        )
+    else:
+        image_channels = intensity[None]
+    image_channels = np.ascontiguousarray(image_channels, dtype=np.float32)
+
+    sums = np.zeros((h, w), np.float32)
+    counts = np.zeros((h, w), np.float32)
+    boundary_sums = np.zeros((h, w), np.float32)
     window_1d = np.hanning(tile).astype(np.float32)
-    blend_window = np.outer(window_1d, window_1d) + 0.05 if config.weighted_tile_blending else np.ones((tile, tile), np.float32)
-    pending: list[tuple[np.ndarray, int, int, int, int, str]] = []
-    transforms = ["identity"] + (["horizontal", "vertical"] if config.use_tta and config.tta_mode == "light" else [])
+    blend_window = (
+        np.outer(window_1d, window_1d) + 0.05
+        if config.weighted_tile_blending else np.ones((tile, tile), np.float32)
+    )
+
+    if not config.use_tta:
+        transforms = [(0, False)]
+    elif config.tta_mode == "light":
+        transforms = [(0, False), (0, True), (2, False), (2, True)]
+    elif config.tta_mode == "dihedral":
+        transforms = [(k, flip) for k in range(4) for flip in (False, True)]
+    else:
+        raise ValueError(f"Unknown TTA mode: {config.tta_mode!r}")
+
+    pending: list[tuple[np.ndarray, int, int, int, int, int, bool]] = []
 
     def flush() -> None:
         if not pending:
             return
-        batch = torch.from_numpy(np.stack([entry[0] for entry in pending])[:, None]).float().to(device)
+        batch_array = np.stack([entry[0] for entry in pending]).astype(np.float32, copy=False)
+        batch = torch.from_numpy(np.ascontiguousarray(batch_array)).to(device)
         output = model(batch)
         semantic = output["semantic"].sigmoid().cpu().numpy()[:, 0]
         boundary = output["boundary"].sigmoid().cpu().numpy()[:, 0]
-        for prediction, boundary_prediction, (_, y, x, oh, ow, transform) in zip(semantic, boundary, pending):
-            if transform == "horizontal": prediction, boundary_prediction = np.fliplr(prediction), np.fliplr(boundary_prediction)
-            if transform == "vertical": prediction, boundary_prediction = np.flipud(prediction), np.flipud(boundary_prediction)
+        for prediction, boundary_prediction, (_, y, x, oh, ow, k, flip_lr) in zip(
+            semantic, boundary, pending
+        ):
+            # Input was flip(rot90(tile)); invert that transform before blending.
+            if flip_lr:
+                prediction = np.flip(prediction, axis=-1)
+                boundary_prediction = np.flip(boundary_prediction, axis=-1)
+            if k:
+                prediction = np.rot90(prediction, -k)
+                boundary_prediction = np.rot90(boundary_prediction, -k)
             weight = blend_window[:oh, :ow]
             sums[y:y + oh, x:x + ow] += prediction[:oh, :ow] * weight
             boundary_sums[y:y + oh, x:x + ow] += boundary_prediction[:oh, :ow] * weight
@@ -804,15 +916,25 @@ def predict_tiled(model: nn.Module, image: np.ndarray, config: PipelineConfig, d
     model.eval()
     for y in tile_starts(h, tile, config.tile_overlap):
         for x in tile_starts(w, tile, config.tile_overlap):
-            crop = image[y:y + tile, x:x + tile]; original_h, original_w = crop.shape
-            crop = np.pad(crop, ((0, tile - original_h), (0, tile - original_w)))
-            for transform in transforms:
-                transformed = np.fliplr(crop).copy() if transform == "horizontal" else np.flipud(crop).copy() if transform == "vertical" else crop
-                pending.append((transformed, y, x, original_h, original_w, transform))
-                if len(pending) == config.inference_batch_size:
+            crop = image_channels[:, y:y + tile, x:x + tile]
+            original_h, original_w = crop.shape[-2:]
+            crop = np.pad(
+                crop,
+                ((0, 0), (0, tile - original_h), (0, tile - original_w)),
+                mode="constant",
+            )
+            for k, flip_lr in transforms:
+                transformed = np.rot90(crop, k, axes=(-2, -1))
+                if flip_lr:
+                    transformed = np.flip(transformed, axis=-1)
+                transformed = np.ascontiguousarray(transformed, dtype=np.float32)
+                pending.append((transformed, y, x, original_h, original_w, k, flip_lr))
+                if len(pending) >= config.inference_batch_size:
                     flush()
     flush()
-    return sums / counts, boundary_sums / counts if config.boundary_head else None
+    return sums / np.maximum(counts, 1e-8), (
+        boundary_sums / np.maximum(counts, 1e-8) if config.boundary_head else None
+    )
 
 
 def mask_to_rle(mask: np.ndarray) -> str:
