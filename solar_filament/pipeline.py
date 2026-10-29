@@ -62,6 +62,8 @@ class PipelineConfig:
     threshold: float = 0.40
     min_component_area: int = 50
     morphology_kernel: int = 0
+    bridge_gap: int = 12
+    fill_holes: bool = True
     watershed: bool = True
     watershed_peak_distance: int = 18
     boundary_mode: str = "guidance"  # disabled, guidance, separator
@@ -822,6 +824,14 @@ def reconstruct_instances(probability: np.ndarray, config: PipelineConfig, bound
     if config.morphology_kernel > 1:
         kernel = np.ones((config.morphology_kernel, config.morphology_kernel), np.uint8)
         binary = cv2.morphologyEx(binary.astype(np.uint8), cv2.MORPH_CLOSE, kernel).astype(bool)
+    if config.fill_holes and binary.any():
+        mask_u8 = binary.astype(np.uint8)
+        flood = mask_u8.copy()
+        flood_pad = np.zeros((flood.shape[0] + 2, flood.shape[1] + 2), np.uint8)
+        cv2.floodFill(flood, flood_pad, (0, 0), 1)
+        binary = (mask_u8 | (1 - flood)).astype(bool)
+        if disk_mask is not None and config.use_solar_disk_mask:
+            binary &= disk_mask
     if config.watershed and binary.any():
         distance = ndi.distance_transform_edt(binary)
         if boundary_probability is not None and config.boundary_mode == "guidance":
@@ -840,7 +850,18 @@ def reconstruct_instances(probability: np.ndarray, config: PipelineConfig, bound
         markers, _ = ndi.label(markers)
         labels = watershed(-distance, markers, mask=watershed_mask) if markers.max() else ndi.label(binary)[0]
     else:
-        labels, _ = ndi.label(binary)
+        if config.bridge_gap > 0 and binary.any():
+            # Bridge only the grouping, not the submitted foreground pixels:
+            # nearby disconnected pieces can belong to one curved filament.
+            radius = max(1, int(config.bridge_gap) // 2)
+            kernel = cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE, (2 * radius + 1, 2 * radius + 1)
+            )
+            dilated = cv2.dilate(binary.astype(np.uint8), kernel)
+            _, group_labels = cv2.connectedComponents(dilated, connectivity=8)
+            labels = np.where(binary, group_labels, 0).astype(np.int32)
+        else:
+            labels, _ = ndi.label(binary)
     for label in positive_instance_labels(labels):
         if (labels == label).sum() < config.min_component_area: labels[labels == label] = 0
     return relabel_sequential(labels)
@@ -1174,6 +1195,15 @@ def optimize_postprocessing(probabilities: Iterable[np.ndarray], boundaries: Ite
     stage6 = [evaluate("solar_disk_mask", {**asdict(best), "use_solar_disk_mask": enabled})
               for enabled in (False, True)]
     best = max(zip(stage6, rows[-len(stage6):]), key=lambda item: (item[1]["pq_pooled"], item[1]["mean_dice"]))[0]
+    if not best.watershed:
+        stage7 = [evaluate("bridge_gap", {**asdict(best), "bridge_gap": gap})
+                  for gap in (0, 4, 8, 12, 18, 24, 32, 40)]
+        best = max(zip(stage7, rows[-len(stage7):]),
+                   key=lambda item: (item[1]["pq_pooled"], item[1]["mean_dice"]))[0]
+    stage8 = [evaluate("fill_holes", {**asdict(best), "fill_holes": enabled})
+              for enabled in (False, True)]
+    best = max(zip(stage8, rows[-len(stage8):]),
+               key=lambda item: (item[1]["pq_pooled"], item[1]["mean_dice"]))[0]
     table = pd.DataFrame(rows).sort_values(["pq_pooled", "mean_dice", "mean_pq"], ascending=False).reset_index(drop=True)
     return best, table
 
