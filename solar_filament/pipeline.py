@@ -453,10 +453,8 @@ class SolarFilamentDataset(Dataset[dict[str, Any]]):
 
     def _build_crop_candidates(self) -> None:
         """Build positive and hard-negative crop centers once per annotation view."""
-        gradient_by_stem: dict[str, np.ndarray] = {}
         for image_id in self.image_ids:
             meta = self.index.images[image_id]
-            stem = Path(str(meta["file_name"])).stem
             flat_u8, _ = self._load_preprocessed(image_id)
             labels = self._load_instance_ids(image_id)
             positive = np.argwhere(labels > 0)
@@ -466,11 +464,10 @@ class SolarFilamentDataset(Dataset[dict[str, Any]]):
 
             # Use flattened intensity for the hard-negative texture map. Explicit
             # float32 input avoids OpenCV CV_32F depth/channel assertion failures.
-            gradient = gradient_by_stem.get(stem)
-            if gradient is None:
-                normalized = np.ascontiguousarray(flat_u8.astype(np.float32) / 255.0)
-                gradient = np.abs(cv2.Laplacian(normalized, cv2.CV_32F))
-                gradient_by_stem[stem] = gradient
+            # Keep only one full-resolution gradient map alive at a time: retaining
+            # one per observation would consume many gigabytes of host RAM.
+            normalized = np.ascontiguousarray(flat_u8.astype(np.float32) / 255.0)
+            gradient = np.abs(cv2.Laplacian(normalized, cv2.CV_32F))
             stride = max(32, self.config.train_tile_size // 4)
             half = self.config.train_tile_size // 2
             candidates: list[tuple[int, int]] = []
