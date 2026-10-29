@@ -462,20 +462,25 @@ class SolarFilamentDataset(Dataset[dict[str, Any]]):
                 positive = positive[::max(1, len(positive) // 4096)]
             self.positive_centers[image_id] = positive.astype(np.int32, copy=False)
 
-            # Use flattened intensity for the hard-negative texture map. Explicit
-            # float32 input avoids OpenCV CV_32F depth/channel assertion failures.
-            # Keep only one full-resolution gradient map alive at a time: retaining
-            # one per observation would consume many gigabytes of host RAM.
-            normalized = np.ascontiguousarray(flat_u8.astype(np.float32) / 255.0)
+            # A 1/8-resolution texture map is enough to choose negative crop
+            # centres on the 32-192 px candidate grid. It avoids recomputing a
+            # 2048x2048 Laplacian for every annotator view of the same JPEG and
+            # keeps the map small, while exact labels/crops stay native-resolution.
+            height, width = flat_u8.shape
+            small_h, small_w = max(1, height // 8), max(1, width // 8)
+            small_u8 = cv2.resize(flat_u8, (small_w, small_h), interpolation=cv2.INTER_AREA)
+            normalized = np.ascontiguousarray(small_u8.astype(np.float32) / 255.0)
             gradient = np.abs(cv2.Laplacian(normalized, cv2.CV_32F))
             stride = max(32, self.config.train_tile_size // 4)
             half = self.config.train_tile_size // 2
             candidates: list[tuple[int, int]] = []
             gradient_threshold = float(np.percentile(gradient, 75))
-            for y in range(half, max(half + 1, flat_u8.shape[0] - half), stride):
-                for x in range(half, max(half + 1, flat_u8.shape[1] - half), stride):
+            for y in range(half, max(half + 1, height - half), stride):
+                for x in range(half, max(half + 1, width - half), stride):
                     crop = labels[y-half:y+half, x-half:x+half]
-                    if crop.size and not crop.any() and gradient[y, x] >= gradient_threshold:
+                    gy = min(small_h - 1, int(y * small_h / height))
+                    gx = min(small_w - 1, int(x * small_w / width))
+                    if crop.size and not crop.any() and gradient[gy, gx] >= gradient_threshold:
                         candidates.append((y, x))
             self.hard_negative_centers[image_id] = np.asarray(
                 candidates, dtype=np.int32
