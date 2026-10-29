@@ -15,7 +15,8 @@ Use **[`solar-filament-final-kaggle.ipynb`](solar-filament-final-kaggle.ipynb)**
 
 ## Pipeline module
 
-- `solar_filament/pipeline.py`: COCO parsing, date-grouped splits (keeping every JPEG and annotator view together), compressed instance-mask caching, full-observation normalization, high-resolution crop sampling, ResNet-34 U-Net-style semantic/boundary prediction, pooled PQ metrics, tiled inference, watershed reconstruction, and RLE export.
+- `solar_filament/pipeline.py`: COCO parsing, date-grouped splits (keeping each physical JPEG/date and its annotator views together), compressed label caches, corrected-intensity/radius-channel construction, high-resolution crop sampling, ResNet-34 U-Net-style semantic/boundary prediction, pooled PQ metrics, tiled TTA, gap-aware instance reconstruction, and RLE export.
+- `solar_filament/disk.py`: solar-limb fitting and limb-darkening correction. Attribution and licensing are documented in `THIRD_PARTY_NOTICES.md`.
 - `tests/test_metrics.py`: synthetic metric, string-ID, polygon-rasterization, physical-group-split, and RLE checks.
 - `requirements.txt`: optional non-Torch dependencies; Torch/Torchvision are deliberately not pinned.
 
